@@ -243,6 +243,32 @@ public class OperatorCoordinatorHolder
     }
 
     @Override
+    public boolean supportsRegionCheckpoint() {
+        return coordinator.supportsRegionCheckpoint();
+    }
+
+    @Override
+    public void checkpointCoordinatorForRegionFallback(
+            long checkpointId,
+            long fallbackCheckpointId,
+            Set<Integer> fallbackSubtaskIds,
+            CompletableFuture<byte[]> resultFuture)
+            throws Exception {
+        mainThreadExecutor.execute(
+                () -> {
+                    try {
+                        coordinator.checkpointCoordinatorForRegionFallback(
+                                checkpointId,
+                                fallbackCheckpointId,
+                                fallbackSubtaskIds,
+                                resultFuture);
+                    } catch (Exception e) {
+                        resultFuture.completeExceptionally(e);
+                    }
+                });
+    }
+
+    @Override
     public void checkpointCoordinator(long checkpointId, CompletableFuture<byte[]> result) {
         // unfortunately, this method does not run in the scheduler executor, but in the
         // checkpoint coordinator time thread.

@@ -109,6 +109,12 @@ public class PendingCheckpoint implements Checkpoint {
     /** Set of acknowledged tasks. */
     private final Set<ExecutionAttemptID> acknowledgedTasks;
 
+    /**
+     * Map of declined tasks to their failure causes (used for deferred abort in regional
+     * checkpoint).
+     */
+    private final Map<ExecutionAttemptID, CheckpointException> declinedTasks;
+
     /** The checkpoint properties. */
     private final CheckpointProperties props;
 
@@ -179,6 +185,7 @@ public class PendingCheckpoint implements Checkpoint {
         this.acknowledgedTasks =
                 CollectionUtil.newHashSetWithExpectedSize(
                         checkpointPlan.getTasksToWaitFor().size());
+        this.declinedTasks = new HashMap<>();
         this.onCompletionPromise = checkNotNull(onCompletionPromise);
         this.pendingCheckpointStats = pendingCheckpointStats;
         this.masterTriggerCompletionPromise = checkNotNull(masterTriggerCompletionPromise);
@@ -251,6 +258,49 @@ public class PendingCheckpoint implements Checkpoint {
 
     boolean areTasksFullyAcknowledged() {
         return notYetAcknowledgedTasks.isEmpty() && !disposed;
+    }
+
+    /**
+     * Records a decline from a task for deferred abort in regional checkpoint mode. The decline is
+     * buffered instead of immediately aborting the checkpoint.
+     */
+    public void recordDecline(ExecutionAttemptID attemptId, CheckpointException cause) {
+        synchronized (lock) {
+            declinedTasks.put(attemptId, cause);
+        }
+    }
+
+    /** Returns the map of declined tasks and their failure causes. */
+    public Map<ExecutionAttemptID, CheckpointException> getDeclinedTasks() {
+        synchronized (lock) {
+            return Collections.unmodifiableMap(new HashMap<>(declinedTasks));
+        }
+    }
+
+    /** Returns whether any tasks have declined this checkpoint. */
+    public boolean hasDeclines() {
+        synchronized (lock) {
+            return !declinedTasks.isEmpty();
+        }
+    }
+
+    /**
+     * Returns true if every task in this checkpoint has either acknowledged or declined. This is
+     * used in regional checkpoint mode to determine when to evaluate the checkpoint.
+     */
+    public boolean areAllTasksResponded() {
+        synchronized (lock) {
+            if (disposed) {
+                return false;
+            }
+            // All tasks responded if every remaining not-yet-acknowledged task has declined
+            for (ExecutionAttemptID remaining : notYetAcknowledgedTasks.keySet()) {
+                if (!declinedTasks.containsKey(remaining)) {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     public boolean isAcknowledgedBy(ExecutionAttemptID executionAttemptId) {
@@ -360,6 +410,56 @@ public class PendingCheckpoint implements Checkpoint {
                 onCompletionPromise.completeExceptionally(t);
                 ExceptionUtils.rethrowIOException(t);
                 return null; // silence the compiler
+            }
+        }
+    }
+
+    /**
+     * Finalizes a regional checkpoint where some tasks have declined. Unlike {@link
+     * #finalizeCheckpoint}, this does not require all tasks to have acknowledged. The caller is
+     * responsible for ensuring that the operator states have been properly assembled (healthy
+     * subtasks from current checkpoint, failed subtasks from a fallback checkpoint).
+     */
+    public CompletedCheckpoint finalizeRegionalCheckpoint(
+            CheckpointsCleaner checkpointsCleaner, Runnable postCleanup, Executor executor)
+            throws IOException {
+
+        synchronized (lock) {
+            checkState(!isDisposed(), "checkpoint is discarded");
+
+            try {
+                checkpointPlan.fulfillFinishedTaskStatus(operatorStates);
+
+                final CheckpointMetadata savepoint =
+                        new CheckpointMetadata(
+                                checkpointId, operatorStates.values(), masterStates, props);
+                final CompletedCheckpointStorageLocation finalizedLocation;
+
+                try (CheckpointMetadataOutputStream out =
+                        targetLocation.createMetadataOutputStream()) {
+                    Checkpoints.storeCheckpointMetadata(savepoint, out);
+                    finalizedLocation = out.closeAndFinalizeCheckpoint();
+                }
+
+                CompletedCheckpoint completed =
+                        new CompletedCheckpoint(
+                                jobId,
+                                checkpointId,
+                                checkpointTimestamp,
+                                System.currentTimeMillis(),
+                                operatorStates,
+                                masterStates,
+                                props,
+                                finalizedLocation,
+                                toCompletedCheckpointStats(finalizedLocation));
+
+                dispose(false, checkpointsCleaner, postCleanup, executor);
+
+                return completed;
+            } catch (Throwable t) {
+                onCompletionPromise.completeExceptionally(t);
+                ExceptionUtils.rethrowIOException(t);
+                return null;
             }
         }
     }
@@ -590,6 +690,7 @@ public class PendingCheckpoint implements Checkpoint {
                 disposed = true;
                 notYetAcknowledgedTasks.clear();
                 acknowledgedTasks.clear();
+                declinedTasks.clear();
                 cancelCanceller();
             }
         }
