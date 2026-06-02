@@ -67,12 +67,12 @@ class CheckpointingStatisticsTest extends RestResponseMarshallingTestBase<Checkp
         checkpointStatisticsPerTask.put(
                 new JobVertexID(),
                 new TaskCheckpointStatistics(
-                        1L, CheckpointStatsStatus.COMPLETED, 1L, 2L, 2L, 3L, 4L, 7, 8, 5, 6));
+                        1L, CheckpointStatsStatus.COMPLETED, 1L, 2L, 2L, 3L, 4L, 7, 8, 5, 6, null));
 
         checkpointStatisticsPerTask.put(
                 new JobVertexID(),
                 new TaskCheckpointStatistics(
-                        1L, CheckpointStatsStatus.COMPLETED, 2L, 3L, 3L, 4L, 5L, 8, 9, 6, 7));
+                        1L, CheckpointStatsStatus.COMPLETED, 2L, 3L, 3L, 4L, 5L, 8, 9, 6, 7, null));
 
         final CheckpointStatistics.CompletedCheckpointStatistics completed =
                 new CheckpointStatistics.CompletedCheckpointStatistics(
