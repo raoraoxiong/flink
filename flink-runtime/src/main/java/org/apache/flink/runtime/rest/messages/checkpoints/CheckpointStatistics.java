@@ -35,6 +35,7 @@ import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonCreator;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonInclude;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonSubTypes;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonTypeInfo;
@@ -120,6 +121,8 @@ public class CheckpointStatistics implements ResponseBody {
 
     public static final String FIELD_NAME_CHECKPOINT_TYPE = "checkpoint_type";
 
+    public static final String FIELD_NAME_OLDEST_REF_CHECKPOINT_ID = "oldest_ref_checkpoint_id";
+
     @JsonProperty(FIELD_NAME_ID)
     private final long id;
 
@@ -170,6 +173,11 @@ public class CheckpointStatistics implements ResponseBody {
     @JsonSerialize(keyUsing = JobVertexIDKeySerializer.class)
     private final Map<JobVertexID, TaskCheckpointStatistics> checkpointStatisticsPerTask;
 
+    @JsonProperty(FIELD_NAME_OLDEST_REF_CHECKPOINT_ID)
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Nullable
+    private final Long oldestRefCheckpointId;
+
     @JsonCreator
     private CheckpointStatistics(
             @JsonProperty(FIELD_NAME_ID) long id,
@@ -189,7 +197,9 @@ public class CheckpointStatistics implements ResponseBody {
             @JsonProperty(FIELD_NAME_CHECKPOINT_TYPE) RestAPICheckpointType checkpointType,
             @JsonDeserialize(keyUsing = JobVertexIDKeyDeserializer.class)
                     @JsonProperty(FIELD_NAME_TASKS)
-                    Map<JobVertexID, TaskCheckpointStatistics> checkpointStatisticsPerTask) {
+                    Map<JobVertexID, TaskCheckpointStatistics> checkpointStatisticsPerTask,
+            @JsonProperty(FIELD_NAME_OLDEST_REF_CHECKPOINT_ID) @Nullable
+                    Long oldestRefCheckpointId) {
         this.id = id;
         this.status = Preconditions.checkNotNull(status);
         this.savepoint = savepoint;
@@ -206,6 +216,7 @@ public class CheckpointStatistics implements ResponseBody {
         this.numAckSubtasks = numAckSubtasks;
         this.checkpointType = Preconditions.checkNotNull(checkpointType);
         this.checkpointStatisticsPerTask = Preconditions.checkNotNull(checkpointStatisticsPerTask);
+        this.oldestRefCheckpointId = oldestRefCheckpointId;
     }
 
     public long getId() {
@@ -257,6 +268,11 @@ public class CheckpointStatistics implements ResponseBody {
         return checkpointStatisticsPerTask;
     }
 
+    @Nullable
+    public Long getOldestRefCheckpointId() {
+        return oldestRefCheckpointId;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -280,7 +296,8 @@ public class CheckpointStatistics implements ResponseBody {
                 && numAckSubtasks == that.numAckSubtasks
                 && status == that.status
                 && Objects.equals(checkpointType, that.checkpointType)
-                && Objects.equals(checkpointStatisticsPerTask, that.checkpointStatisticsPerTask);
+                && Objects.equals(checkpointStatisticsPerTask, that.checkpointStatisticsPerTask)
+                && Objects.equals(oldestRefCheckpointId, that.oldestRefCheckpointId);
     }
 
     @Override
@@ -300,7 +317,8 @@ public class CheckpointStatistics implements ResponseBody {
                 numSubtasks,
                 numAckSubtasks,
                 checkpointType,
-                checkpointStatisticsPerTask);
+                checkpointStatisticsPerTask,
+                oldestRefCheckpointId);
     }
 
     // -------------------------------------------------------------------------
@@ -334,7 +352,8 @@ public class CheckpointStatistics implements ResponseBody {
                                 taskStateStat.getProcessedDataStats(),
                                 taskStateStat.getPersistedDataStats(),
                                 taskStateStat.getNumberOfSubtasks(),
-                                taskStateStat.getNumberOfAcknowledgedSubtasks()));
+                                taskStateStat.getNumberOfAcknowledgedSubtasks(),
+                                null));
             }
         } else {
             checkpointStatisticsPerTask = Collections.emptyMap();
@@ -507,7 +526,8 @@ public class CheckpointStatistics implements ResponseBody {
                     numSubtasks,
                     numAckSubtasks,
                     checkpointType,
-                    checkpointingStatisticsPerTask);
+                    checkpointingStatisticsPerTask,
+                    null);
 
             this.externalPath = externalPath;
             this.discarded = discarded;
@@ -595,7 +615,8 @@ public class CheckpointStatistics implements ResponseBody {
                     numSubtasks,
                     numAckSubtasks,
                     checkpointType,
-                    checkpointingStatisticsPerTask);
+                    checkpointingStatisticsPerTask,
+                    null);
 
             this.failureTimestamp = failureTimestamp;
             this.failureMessage = failureMessage;
@@ -671,7 +692,8 @@ public class CheckpointStatistics implements ResponseBody {
                     numSubtasks,
                     numAckSubtasks,
                     checkpointType,
-                    checkpointingStatisticsPerTask);
+                    checkpointingStatisticsPerTask,
+                    null);
         }
 
         @Override

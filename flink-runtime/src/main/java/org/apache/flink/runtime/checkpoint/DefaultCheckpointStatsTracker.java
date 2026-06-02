@@ -159,6 +159,9 @@ public class DefaultCheckpointStatsTracker implements CheckpointStatsTracker {
 
     private final JobManagerJobMetricGroup metricGroup;
 
+    /** Counter for completed regional checkpoints. */
+    private long regionalCheckpointCount;
+
     private Optional<JobInitializationMetricsBuilder> jobInitializationMetricsBuilder =
             Optional.empty();
     @Nullable private final CheckpointStatsListener checkpointStatsListener;
@@ -535,6 +538,16 @@ public class DefaultCheckpointStatsTracker implements CheckpointStatsTracker {
     }
 
     @Override
+    public void reportRegionalCheckpointCompleted() {
+        statsReadWriteLock.lock();
+        try {
+            regionalCheckpointCount++;
+        } finally {
+            statsReadWriteLock.unlock();
+        }
+    }
+
+    @Override
     public PendingCheckpointStats getPendingCheckpointStats(long checkpointId) {
         statsReadWriteLock.lock();
         try {
@@ -685,6 +698,9 @@ public class DefaultCheckpointStatsTracker implements CheckpointStatsTracker {
     @VisibleForTesting
     static final String LATEST_CHECKPOINT_COMPLETED_TIMESTAMP = "lastCheckpointCompletedTimestamp";
 
+    @VisibleForTesting
+    static final String NUMBER_OF_REGIONAL_CHECKPOINTS_METRIC = "regionalCheckpointCount";
+
     /**
      * Register the exposed metrics.
      *
@@ -725,6 +741,7 @@ public class DefaultCheckpointStatsTracker implements CheckpointStatsTracker {
         metricGroup.gauge(
                 LATEST_CHECKPOINT_COMPLETED_TIMESTAMP,
                 new LatestCheckpointCompletedTimestampGauge());
+        metricGroup.gauge(NUMBER_OF_REGIONAL_CHECKPOINTS_METRIC, new RegionalCheckpointsCounter());
     }
 
     private class CheckpointsCounter implements Gauge<Long> {
@@ -865,6 +882,13 @@ public class DefaultCheckpointStatsTracker implements CheckpointStatsTracker {
             } else {
                 return -1L;
             }
+        }
+    }
+
+    private class RegionalCheckpointsCounter implements Gauge<Long> {
+        @Override
+        public Long getValue() {
+            return regionalCheckpointCount;
         }
     }
 
