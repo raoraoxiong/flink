@@ -107,6 +107,68 @@ public class SplitAssignmentTracker<SplitT extends SourceSplit> {
     }
 
     /**
+     * Get all splits assigned to the given subtasks after the given checkpointId without removing
+     * them. This is used for Regional Checkpoint to determine which splits need to be rolled back
+     * when a region falls back to a historical checkpoint.
+     *
+     * @param checkpointId the checkpoint ID to look after.
+     * @param subtaskIds the set of subtask IDs to query.
+     * @return a map from subtask ID to the list of splits assigned after the given checkpoint.
+     */
+    public Map<Integer, List<SplitT>> getAssignmentsAfterCheckpoint(
+            long checkpointId, Set<Integer> subtaskIds) {
+        final Map<Integer, List<SplitT>> result = new HashMap<>();
+        for (int subtaskId : subtaskIds) {
+            final List<SplitT> splits = new ArrayList<>();
+            for (Map.Entry<Long, Map<Integer, LinkedHashSet<SplitT>>> entry :
+                    assignmentsByCheckpointId.entrySet()) {
+                if (entry.getKey() > checkpointId) {
+                    LinkedHashSet<SplitT> assigned = entry.getValue().get(subtaskId);
+                    if (assigned != null) {
+                        splits.addAll(assigned);
+                    }
+                }
+            }
+            LinkedHashSet<SplitT> uncheckpointed = uncheckpointedAssignments.get(subtaskId);
+            if (uncheckpointed != null) {
+                splits.addAll(uncheckpointed);
+            }
+            if (!splits.isEmpty()) {
+                result.put(subtaskId, splits);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Remove and return all splits assigned to the given subtasks after the given checkpointId.
+     * This is used for Regional Checkpoint rollback: when a region falls back to a historical
+     * checkpoint, the splits assigned after that checkpoint must be returned to the enumerator.
+     *
+     * @param checkpointId the checkpoint ID to look after.
+     * @param subtaskIds the set of subtask IDs whose assignments should be removed.
+     * @return a map from subtask ID to the list of splits removed.
+     */
+    public Map<Integer, List<SplitT>> removeAssignmentsAfterCheckpoint(
+            long checkpointId, Set<Integer> subtaskIds) {
+        final Map<Integer, List<SplitT>> result = new HashMap<>();
+        for (int subtaskId : subtaskIds) {
+            final List<SplitT> splits = new ArrayList<>();
+            for (Map.Entry<Long, Map<Integer, LinkedHashSet<SplitT>>> entry :
+                    assignmentsByCheckpointId.entrySet()) {
+                if (entry.getKey() > checkpointId) {
+                    removeFromAssignment(subtaskId, entry.getValue(), splits);
+                }
+            }
+            removeFromAssignment(subtaskId, uncheckpointedAssignments, splits);
+            if (!splits.isEmpty()) {
+                result.put(subtaskId, splits);
+            }
+        }
+        return result;
+    }
+
+    /**
      * This method is invoked when a source reader fails over. In this case, the source reader will
      * restore its split assignment to the last successful checkpoint. Any split assignment to that
      * source reader after the last successful checkpoint will be lost on the source reader side as
