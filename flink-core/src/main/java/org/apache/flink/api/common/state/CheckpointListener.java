@@ -122,6 +122,29 @@ public interface CheckpointListener {
     void notifyCheckpointComplete(long checkpointId) throws Exception;
 
     /**
+     * Notifies the listener that the checkpoint with the given {@code checkpointId} completed and
+     * was committed, providing additional context about whether this is a regional checkpoint.
+     *
+     * <p>This method is called instead of {@link #notifyCheckpointComplete(long)} when the
+     * framework has Regional Checkpoint information available. The default implementation delegates
+     * to {@link #notifyCheckpointComplete(long)}, so existing implementations are unaffected.
+     *
+     * <p>Implementations that need to distinguish between global checkpoints (all tasks
+     * acknowledged) and regional checkpoints (some tasks fell back to historical state) can
+     * override this method to inspect the {@link RegionalCheckpointInfo}.
+     *
+     * @param checkpointId The ID of the checkpoint that has been completed.
+     * @param regionalCheckpointInfo Context about which subtasks used historical state. Use {@link
+     *     RegionalCheckpointInfo#isGlobalCheckpoint()} to check if all tasks acknowledged.
+     * @throws Exception This method can propagate exceptions, which leads to a failure/recovery for
+     *     the task. Note that this will NOT lead to the checkpoint being revoked.
+     */
+    default void notifyCheckpointComplete(
+            long checkpointId, RegionalCheckpointInfo regionalCheckpointInfo) throws Exception {
+        notifyCheckpointComplete(checkpointId);
+    }
+
+    /**
      * This method is called as a notification once a distributed checkpoint has been aborted.
      *
      * <p><b>Important:</b> The fact that a checkpoint has been aborted does NOT mean that the data
