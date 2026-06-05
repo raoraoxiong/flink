@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.checkpoint;
 
 import org.apache.flink.api.common.state.CheckpointListener;
+import org.apache.flink.api.common.state.RegionalCheckpointInfo;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
 import org.apache.flink.runtime.operators.coordination.OperatorInfo;
 
@@ -45,6 +46,14 @@ public interface OperatorCoordinatorCheckpointContext extends OperatorInfo, Chec
      */
     @Override
     void notifyCheckpointComplete(long checkpointId);
+
+    /**
+     * Notifies the coordinator that a regional checkpoint has completed, providing context about
+     * which subtasks used historical state.
+     */
+    default void notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
+        notifyCheckpointComplete(checkpointId);
+    }
 
     /**
      * We override the method here to remove the checked exception. Please check the Java docs of

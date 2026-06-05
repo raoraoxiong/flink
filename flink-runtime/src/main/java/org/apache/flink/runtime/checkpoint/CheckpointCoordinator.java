@@ -20,6 +20,7 @@ package org.apache.flink.runtime.checkpoint;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.state.RegionalCheckpointInfo;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.execution.CheckpointType;
 import org.apache.flink.core.execution.SavepointFormatType;
@@ -1668,7 +1669,7 @@ public class CheckpointCoordinator {
         // For simplicity in this first implementation, complete synchronously if no async
         // coordinator futures, otherwise schedule completion after futures resolve.
         if (coordinatorFutures.isEmpty()) {
-            completeRegionalCheckpoint(checkpoint, failedVertices);
+            completeRegionalCheckpoint(checkpoint, failedVertices, fallbackCheckpointId);
         } else {
             // Wait for all coordinator futures to complete, then finalize
             final PendingCheckpoint capturedCheckpoint = checkpoint;
@@ -1678,7 +1679,7 @@ public class CheckpointCoordinator {
                                 synchronized (lock) {
                                     if (!capturedCheckpoint.isDisposed()) {
                                         completeRegionalCheckpoint(
-                                                capturedCheckpoint, failedVertices);
+                                                capturedCheckpoint, failedVertices, fallbackCheckpointId);
                                     }
                                 }
                             })
@@ -1701,7 +1702,9 @@ public class CheckpointCoordinator {
 
     /** Completes a regional checkpoint by finalizing it and notifying only healthy region tasks. */
     private void completeRegionalCheckpoint(
-            PendingCheckpoint checkpoint, Set<ExecutionVertex> failedVertices) {
+            PendingCheckpoint checkpoint,
+            Set<ExecutionVertex> failedVertices,
+            long fallbackCheckpointId) {
         assert (Thread.holdsLock(lock));
         try {
             final long checkpointId = checkpoint.getCheckpointID();
@@ -1739,11 +1742,27 @@ public class CheckpointCoordinator {
                             .filter(ev -> !failedVertices.contains(ev))
                             .collect(Collectors.toList());
 
+            // Build RegionalCheckpointInfo for coordinators
+            final Set<Integer> fallbackSubtaskIndices = new HashSet<>();
+            for (ExecutionVertex ev : failedVertices) {
+                fallbackSubtaskIndices.add(ev.getParallelSubtaskIndex());
+            }
+            final Map<Long, Set<Integer>> fallbackMap = new HashMap<>();
+            fallbackMap.put(fallbackCheckpointId, fallbackSubtaskIndices);
+            final RegionalCheckpointInfo regionalInfo = new RegionalCheckpointInfo(fallbackMap);
+
+            // Send ack to healthy tasks (task-side notification, no RegionalCheckpointInfo via RPC yet)
             sendAcknowledgeMessages(
                     healthyTasks,
                     checkpointId,
                     completedCheckpoint.getTimestamp(),
                     extractIdIfDiscardedOnSubsumed(lastSubsumed));
+
+            // Notify coordinators with RegionalCheckpointInfo
+            for (OperatorCoordinatorCheckpointContext coordinatorContext :
+                    coordinatorsToCheckpoint) {
+                coordinatorContext.notifyCheckpointComplete(checkpointId, regionalInfo);
+            }
 
             LOG.info(
                     "Regional checkpoint {} completed successfully. "

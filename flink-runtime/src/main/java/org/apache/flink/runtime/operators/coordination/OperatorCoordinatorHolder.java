@@ -21,6 +21,7 @@ package org.apache.flink.runtime.operators.coordination;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.state.RegionalCheckpointInfo;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.metrics.groups.OperatorCoordinatorMetricGroup;
 import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
@@ -287,6 +288,23 @@ public class OperatorCoordinatorHolder
                             .values()
                             .forEach(x -> x.openGatewayAndUnmarkCheckpoint(checkpointId));
                     coordinator.notifyCheckpointComplete(checkpointId);
+                });
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
+        mainThreadExecutor.execute(
+                () -> {
+                    subtaskGatewayMap
+                            .values()
+                            .forEach(x -> x.openGatewayAndUnmarkCheckpoint(checkpointId));
+                    try {
+                        coordinator.notifyCheckpointComplete(checkpointId, info);
+                    } catch (Exception e) {
+                        throw new RuntimeException(
+                                "Exception in notifyCheckpointComplete with RegionalCheckpointInfo",
+                                e);
+                    }
                 });
     }
 
