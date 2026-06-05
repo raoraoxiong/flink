@@ -185,7 +185,7 @@
           <td>{{ subTask['alignment']['duration'] | humanizeDuration }}</td>
           <td>{{ subTask['start_delay'] | humanizeDuration }}</td>
           <td>{{ subTask['unaligned_checkpoint'] }}</td>
-          <td>{{ subTask['ref_checkpoint_id'] != null ? subTask['ref_checkpoint_id'] : '-' }}</td>
+          <td>{{ subTask['ref_checkpoint_id'] !== null ? subTask['ref_checkpoint_id'] : '-' }}</td>
         </ng-container>
         <ng-container *ngIf="subTask['status'] === 'pending_or_failed'">
           <td colspan="11">n/a</td>
