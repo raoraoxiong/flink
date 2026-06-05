@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CheckpointListenerRegionalTest {
 
@@ -35,17 +36,19 @@ class CheckpointListenerRegionalTest {
         RegionalCheckpointInfo info = RegionalCheckpointInfo.globalCheckpoint();
         assertThat(info.isGlobalCheckpoint()).isTrue();
         assertThat(info.getFallbackCheckpointSubtasks()).isEmpty();
+        assertThat(info.getFallbackCheckpointIds()).isEmpty();
     }
 
     @Test
     void testRegionalCheckpointInfoNotGlobal() {
-        Map<Long, Set<Integer>> fallback = new HashMap<>();
-        fallback.put(99L, Set.of(0, 2));
+        Map<Long, Set<String>> fallback = new HashMap<>();
+        fallback.put(99L, Set.of("Source: kafka_source#0", "Map#0", "Sink#0"));
         RegionalCheckpointInfo info = new RegionalCheckpointInfo(fallback);
 
         assertThat(info.isGlobalCheckpoint()).isFalse();
-        assertThat(info.getFallbackCheckpointSubtasks()).containsKey(99L);
-        assertThat(info.getFallbackCheckpointSubtasks().get(99L)).containsExactlyInAnyOrder(0, 2);
+        assertThat(info.getFallbackCheckpointIds()).containsExactly(99L);
+        assertThat(info.getFallbackCheckpointSubtasks().get(99L))
+                .containsExactlyInAnyOrder("Source: kafka_source#0", "Map#0", "Sink#0");
     }
 
     @Test
@@ -60,8 +63,8 @@ class CheckpointListenerRegionalTest {
                     }
                 };
 
-        Map<Long, Set<Integer>> fallback = new HashMap<>();
-        fallback.put(99L, Set.of(0));
+        Map<Long, Set<String>> fallback = new HashMap<>();
+        fallback.put(99L, Set.of("Source#0"));
         RegionalCheckpointInfo info = new RegionalCheckpointInfo(fallback);
 
         listener.notifyCheckpointComplete(100L, info);
@@ -84,8 +87,8 @@ class CheckpointListenerRegionalTest {
                     }
                 };
 
-        Map<Long, Set<Integer>> fallback = new HashMap<>();
-        fallback.put(99L, Set.of(0));
+        Map<Long, Set<String>> fallback = new HashMap<>();
+        fallback.put(99L, Set.of("Source#0"));
         listener.notifyCheckpointComplete(100L, new RegionalCheckpointInfo(fallback));
         assertThat(wasRegional.get()).isTrue();
 
@@ -95,12 +98,22 @@ class CheckpointListenerRegionalTest {
 
     @Test
     void testFallbackMapIsUnmodifiable() {
-        Map<Long, Set<Integer>> fallback = new HashMap<>();
-        fallback.put(99L, Set.of(0));
+        Map<Long, Set<String>> fallback = new HashMap<>();
+        fallback.put(99L, Set.of("Source#0"));
         RegionalCheckpointInfo info = new RegionalCheckpointInfo(fallback);
 
-        org.assertj.core.api.Assertions.assertThatThrownBy(
-                        () -> info.getFallbackCheckpointSubtasks().put(98L, Set.of(1)))
+        assertThatThrownBy(() -> info.getFallbackCheckpointSubtasks().put(98L, Set.of("Map#1")))
                 .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void testMultipleFallbackCheckpoints() {
+        Map<Long, Set<String>> fallback = new HashMap<>();
+        fallback.put(99L, Set.of("Source#0", "Map#0"));
+        fallback.put(98L, Set.of("Source#1"));
+        RegionalCheckpointInfo info = new RegionalCheckpointInfo(fallback);
+
+        assertThat(info.isGlobalCheckpoint()).isFalse();
+        assertThat(info.getFallbackCheckpointIds()).containsExactlyInAnyOrder(99L, 98L);
     }
 }

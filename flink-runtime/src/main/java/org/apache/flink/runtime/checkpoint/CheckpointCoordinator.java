@@ -1743,12 +1743,13 @@ public class CheckpointCoordinator {
                             .collect(Collectors.toList());
 
             // Build RegionalCheckpointInfo for coordinators
-            final Set<Integer> fallbackSubtaskIndices = new HashSet<>();
+            final Set<String> fallbackSubtaskIdentifiers = new HashSet<>();
             for (ExecutionVertex ev : failedVertices) {
-                fallbackSubtaskIndices.add(ev.getParallelSubtaskIndex());
+                fallbackSubtaskIdentifiers.add(
+                        ev.getTaskNameWithSubtaskIndex() + "#" + ev.getParallelSubtaskIndex());
             }
-            final Map<Long, Set<Integer>> fallbackMap = new HashMap<>();
-            fallbackMap.put(fallbackCheckpointId, fallbackSubtaskIndices);
+            final Map<Long, Set<String>> fallbackMap = new HashMap<>();
+            fallbackMap.put(fallbackCheckpointId, fallbackSubtaskIdentifiers);
             final RegionalCheckpointInfo regionalInfo = new RegionalCheckpointInfo(fallbackMap);
 
             // Send ack to healthy tasks (task-side notification, no RegionalCheckpointInfo via RPC yet)
