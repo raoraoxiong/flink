@@ -353,11 +353,18 @@ public class CheckpointStatistics implements ResponseBody {
                                 taskStateStat.getPersistedDataStats(),
                                 taskStateStat.getNumberOfSubtasks(),
                                 taskStateStat.getNumberOfAcknowledgedSubtasks(),
-                                null));
+                                taskStateStat.getSummaryStats().getOldestRefCheckpointId()));
             }
         } else {
             checkpointStatisticsPerTask = Collections.emptyMap();
         }
+        // The checkpoint-level oldest reference id is the minimum across all tasks.
+        final Long oldestRefCheckpointId =
+                checkpointStatisticsPerTask.values().stream()
+                        .map(TaskCheckpointStatistics::getOldestRefCheckpointId)
+                        .filter(Objects::nonNull)
+                        .min(Long::compareTo)
+                        .orElse(null);
         String savepointFormat = null;
         SnapshotType snapshotType = checkpointStats.getProperties().getCheckpointType();
         if (snapshotType instanceof SavepointType) {
@@ -387,7 +394,8 @@ public class CheckpointStatistics implements ResponseBody {
                             completedCheckpointStats.isUnalignedCheckpoint()),
                     checkpointStatisticsPerTask,
                     completedCheckpointStats.getExternalPath(),
-                    completedCheckpointStats.isDiscarded());
+                    completedCheckpointStats.isDiscarded(),
+                    oldestRefCheckpointId);
         } else if (checkpointStats instanceof FailedCheckpointStats) {
             final FailedCheckpointStats failedCheckpointStats =
                     ((FailedCheckpointStats) checkpointStats);
@@ -509,7 +517,9 @@ public class CheckpointStatistics implements ResponseBody {
                         @JsonProperty(FIELD_NAME_TASKS)
                         Map<JobVertexID, TaskCheckpointStatistics> checkpointingStatisticsPerTask,
                 @JsonProperty(FIELD_NAME_EXTERNAL_PATH) @Nullable String externalPath,
-                @JsonProperty(FIELD_NAME_DISCARDED) boolean discarded) {
+                @JsonProperty(FIELD_NAME_DISCARDED) boolean discarded,
+                @JsonProperty(FIELD_NAME_OLDEST_REF_CHECKPOINT_ID) @Nullable
+                        Long oldestRefCheckpointId) {
             super(
                     id,
                     status,
@@ -527,7 +537,7 @@ public class CheckpointStatistics implements ResponseBody {
                     numAckSubtasks,
                     checkpointType,
                     checkpointingStatisticsPerTask,
-                    null);
+                    oldestRefCheckpointId);
 
             this.externalPath = externalPath;
             this.discarded = discarded;

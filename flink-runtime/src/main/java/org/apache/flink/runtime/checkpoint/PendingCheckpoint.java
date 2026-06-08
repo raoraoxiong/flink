@@ -24,6 +24,7 @@ import org.apache.flink.runtime.checkpoint.metadata.CheckpointMetadata;
 import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.ExecutionVertex;
+import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.operators.coordination.OperatorInfo;
 import org.apache.flink.runtime.state.CheckpointMetadataOutputStream;
@@ -52,6 +53,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -527,6 +529,10 @@ public class PendingCheckpoint implements Checkpoint {
                 long checkpointStartDelayMillis =
                         metrics.getCheckpointStartDelayNanos() / 1_000_000;
 
+                // Extract the regional-checkpoint reference id if this acknowledged state was
+                // reused from a historical checkpoint (normally empty for a regular acknowledge).
+                Long refCheckpointId = extractRefCheckpointId(operatorSubtaskStates);
+
                 SubtaskStateStats subtaskStateStats =
                         new SubtaskStateStats(
                                 vertex.getParallelSubtaskIndex(),
@@ -540,7 +546,8 @@ public class PendingCheckpoint implements Checkpoint {
                                 alignmentDurationMillis,
                                 checkpointStartDelayMillis,
                                 metrics.getUnalignedCheckpoint(),
-                                true);
+                                true,
+                                refCheckpointId);
 
                 LOG.trace(
                         "Checkpoint {} stats for {}: size={}Kb, duration={}ms, sync part={}ms, async part={}ms",
@@ -559,6 +566,62 @@ public class PendingCheckpoint implements Checkpoint {
 
             return TaskAcknowledgeResult.SUCCESS;
         }
+    }
+
+    /**
+     * Reports statistics for a subtask in a failed region of a regional checkpoint, whose state was
+     * reused from the historical checkpoint {@code refCheckpointId}. Such subtasks neither
+     * acknowledge nor decline into the stats, so their stats must be reported explicitly when the
+     * regional checkpoint completes, in order to surface the reference id through the REST API.
+     *
+     * @param jobVertexId the job vertex the subtask belongs to
+     * @param subtaskIndex the parallel subtask index
+     * @param ackTimestamp the completion timestamp of the regional checkpoint
+     * @param refCheckpointId the historical checkpoint id the subtask's state originates from
+     */
+    public void reportFallbackSubtaskStats(
+            JobVertexID jobVertexId, int subtaskIndex, long ackTimestamp, long refCheckpointId) {
+        synchronized (lock) {
+            if (pendingCheckpointStats == null) {
+                return;
+            }
+            SubtaskStateStats subtaskStateStats =
+                    new SubtaskStateStats(
+                            subtaskIndex,
+                            ackTimestamp,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            false,
+                            true,
+                            refCheckpointId);
+            pendingCheckpointStats.reportSubtaskStats(jobVertexId, subtaskStateStats);
+        }
+    }
+
+    /**
+     * Extracts the regional-checkpoint reference id from the given task state snapshot, i.e. the
+     * historical checkpoint id this state was reused from. Returns {@code null} if no operator
+     * subtask state carries a reference id (the regular case).
+     */
+    private static Long extractRefCheckpointId(TaskStateSnapshot operatorSubtaskStates) {
+        if (operatorSubtaskStates == null) {
+            return null;
+        }
+        Long oldest = null;
+        for (Map.Entry<OperatorID, OperatorSubtaskState> entry :
+                operatorSubtaskStates.getSubtaskStateMappings()) {
+            OptionalLong refId = entry.getValue().getRefCheckpointId();
+            if (refId.isPresent()) {
+                oldest = oldest == null ? refId.getAsLong() : Math.min(oldest, refId.getAsLong());
+            }
+        }
+        return oldest;
     }
 
     private void updateOperatorState(
