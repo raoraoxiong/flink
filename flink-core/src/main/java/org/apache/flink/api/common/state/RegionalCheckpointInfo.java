@@ -29,8 +29,8 @@ import java.util.Set;
  * implementations to distinguish between a global checkpoint and a regional checkpoint.
  *
  * <p>A <b>global checkpoint</b> is one where all tasks acknowledged successfully. A <b>regional
- * checkpoint</b> is one where some tasks failed to acknowledge and their state was replaced by state
- * from a previous successful checkpoint.
+ * checkpoint</b> is one where some tasks failed to acknowledge and their state was replaced by
+ * state from a previous successful checkpoint.
  *
  * <p>This class provides:
  *
@@ -54,16 +54,15 @@ public class RegionalCheckpointInfo {
      * Mapping from fallback checkpointId to the set of operator-subtask identifiers whose state
      * originates from that historical checkpoint rather than the current one.
      *
-     * <p>Each entry in the set is formatted as "operatorName#subtaskIndex" (e.g., "Source: my_source
-     * -> Sink: my_sink#0"). In practice, implementations typically only need to check {@link
-     * #isGlobalCheckpoint()} or use {@link #getFallbackCheckpointIds()} to determine which
+     * <p>Each entry in the set is formatted as "operatorName#subtaskIndex" (e.g., "Source:
+     * my_source -> Sink: my_sink#0"). In practice, implementations typically only need to check
+     * {@link #isGlobalCheckpoint()} or use {@link #getFallbackCheckpointIds()} to determine which
      * historical checkpoints are referenced.
      */
     private final Map<Long, Set<String>> fallbackCheckpointSubtasks;
 
     public RegionalCheckpointInfo(Map<Long, Set<String>> fallbackCheckpointSubtasks) {
-        this.fallbackCheckpointSubtasks =
-                Collections.unmodifiableMap(fallbackCheckpointSubtasks);
+        this.fallbackCheckpointSubtasks = Collections.unmodifiableMap(fallbackCheckpointSubtasks);
     }
 
     /** Returns a {@link RegionalCheckpointInfo} representing a global checkpoint. */
