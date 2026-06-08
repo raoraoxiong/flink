@@ -69,8 +69,8 @@ public class SplitAssignmentTracker<SplitT extends SourceSplit> {
     /** Take a snapshot of the split assignments. */
     public byte[] snapshotState(SimpleVersionedSerializer<SplitT> splitSerializer)
             throws Exception {
-        return SourceCoordinatorSerdeUtils.serializeAssignments(
-                uncheckpointedAssignments, splitSerializer);
+        return SourceCoordinatorSerdeUtils.serializeAssignmentTracker(
+                uncheckpointedAssignments, assignmentsByCheckpointId, splitSerializer);
     }
 
     /**
@@ -83,8 +83,12 @@ public class SplitAssignmentTracker<SplitT extends SourceSplit> {
     public void restoreState(
             SimpleVersionedSerializer<SplitT> splitSerializer, byte[] assignmentData)
             throws Exception {
-        uncheckpointedAssignments =
-                SourceCoordinatorSerdeUtils.deserializeAssignments(assignmentData, splitSerializer);
+        final SourceCoordinatorSerdeUtils.AssignmentTrackerState<SplitT> state =
+                SourceCoordinatorSerdeUtils.deserializeAssignmentTracker(
+                        assignmentData, splitSerializer);
+        uncheckpointedAssignments = state.uncheckpointedAssignments;
+        assignmentsByCheckpointId.clear();
+        assignmentsByCheckpointId.putAll(state.assignmentsByCheckpointId);
     }
 
     /**
