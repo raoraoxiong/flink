@@ -1750,6 +1750,18 @@ public class CheckpointCoordinator {
         try {
             final long checkpointId = checkpoint.getCheckpointID();
 
+            // Report stats for subtasks in failed regions: they neither acknowledged nor declined
+            // into the stats, but their state was reused from the historical (fallback) checkpoint.
+            // This surfaces the reference id through metrics / REST before the stats are finalized.
+            final long fallbackStatsTimestamp = System.currentTimeMillis();
+            for (ExecutionVertex failedVertex : failedVertices) {
+                checkpoint.reportFallbackSubtaskStats(
+                        failedVertex.getJobvertexId(),
+                        failedVertex.getParallelSubtaskIndex(),
+                        fallbackStatsTimestamp,
+                        fallbackCheckpointId);
+            }
+
             completedCheckpointStore.getSharedStateRegistry().checkpointCompleted(checkpointId);
 
             final CompletedCheckpoint completedCheckpoint =

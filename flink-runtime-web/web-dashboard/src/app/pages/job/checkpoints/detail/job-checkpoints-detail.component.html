@@ -98,11 +98,7 @@
             }})
           </td>
           <td>
-            {{
-              checkPointDetail['tasks'][vertex.id]['oldest_ref_checkpoint_id'] !== null
-                ? checkPointDetail['tasks'][vertex.id]['oldest_ref_checkpoint_id']
-                : '-'
-            }}
+            {{ checkPointDetail['tasks'][vertex.id]['oldest_ref_checkpoint_id'] ?? '-' }}
           </td>
         </tr>
         <tr [nzExpand]="vertex.expand">

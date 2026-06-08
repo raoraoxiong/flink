@@ -221,7 +221,9 @@ public class TaskCheckpointStatisticDetailsHandler
                                 subtask.getCheckpointStartDelay(),
                                 subtask.getUnalignedCheckpoint(),
                                 !subtask.isCompleted(),
-                                null));
+                                subtask.getRefCheckpointId().isPresent()
+                                        ? subtask.getRefCheckpointId().getAsLong()
+                                        : null));
             }
         }
 

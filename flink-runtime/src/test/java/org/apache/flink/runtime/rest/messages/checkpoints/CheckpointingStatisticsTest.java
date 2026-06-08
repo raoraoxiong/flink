@@ -93,7 +93,8 @@ class CheckpointingStatisticsTest extends RestResponseMarshallingTestBase<Checkp
                         RestAPICheckpointType.valueOf(CheckpointType.CHECKPOINT, true),
                         Collections.emptyMap(),
                         null,
-                        false);
+                        false,
+                        null);
 
         final CheckpointStatistics.CompletedCheckpointStatistics savepoint =
                 new CheckpointStatistics.CompletedCheckpointStatistics(
@@ -115,7 +116,8 @@ class CheckpointingStatisticsTest extends RestResponseMarshallingTestBase<Checkp
                                 SavepointType.savepoint(SavepointFormatType.CANONICAL), false),
                         checkpointStatisticsPerTask,
                         "externalPath",
-                        false);
+                        false,
+                        null);
 
         final CheckpointStatistics.FailedCheckpointStatistics failed =
                 new CheckpointStatistics.FailedCheckpointStatistics(

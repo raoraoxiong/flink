@@ -87,6 +87,40 @@ The `/jobs/{jobid}/checkpoints` endpoint includes:
 
 The Checkpoint configuration page displays Regional Checkpoint settings. The Checkpoint detail page shows which subtasks reference historical checkpoints.
 
+## Detecting Regional Checkpoints in User Code
+
+A regional checkpoint is still a logically complete, committed checkpoint, so it is delivered through the
+regular `notifyCheckpointComplete` path. User code that needs to distinguish a global checkpoint from a
+regional one (for example, an exactly-once sink that wants to know whether some subtasks fell back to
+historical state) can observe this context via the `RegionalCheckpointInfo` provided by the framework.
+
+`RegionalCheckpointInfo` is intentionally exposed at the user-facing API boundary (`flink-core`); the
+runtime does not require any operator to consume it. There are two entry points:
+
+* **`CheckpointListener`** — implement the default method
+  `notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info)`. The default implementation
+  delegates to `notifyCheckpointComplete(long)`, so existing implementations are unaffected and only
+  opt in when they override it.
+
+  ```java
+  @Override
+  public void notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
+      if (info.isGlobalCheckpoint()) {
+          // all tasks acknowledged the current checkpoint
+      } else {
+          // some subtasks reused state from these historical checkpoints
+          Set<Long> fallbackIds = info.getFallbackCheckpointIds();
+      }
+  }
+  ```
+
+* **`OperatorCoordinator`** — coordinators receive the same `RegionalCheckpointInfo` when the regional
+  checkpoint completes, which is the natural place to coordinate cross-subtask commit logic.
+
+For a regional checkpoint, `RegionalCheckpointInfo#isGlobalCheckpoint()` returns `false` and
+`getFallbackCheckpointIds()` lists the historical checkpoint ids whose state was reused. For a global
+checkpoint it returns `true` with an empty fallback set.
+
 ## Limitations
 
 1. **POINTWISE topologies only**: Jobs with ALL_TO_ALL edges (keyBy, rebalance) form a single region and cannot benefit from this feature.
