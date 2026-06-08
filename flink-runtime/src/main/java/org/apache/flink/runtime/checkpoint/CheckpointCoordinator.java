@@ -30,7 +30,6 @@ import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
 import org.apache.flink.runtime.executiongraph.ExecutionVertex;
-import org.apache.flink.runtime.scheduler.strategy.ExecutionVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
@@ -41,6 +40,7 @@ import org.apache.flink.runtime.messages.checkpoint.DeclineCheckpoint;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
 import org.apache.flink.runtime.operators.coordination.OperatorInfo;
 import org.apache.flink.runtime.persistence.PossibleInconsistentStateException;
+import org.apache.flink.runtime.scheduler.strategy.ExecutionVertexID;
 import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.CheckpointStorageCoordinatorView;
 import org.apache.flink.runtime.state.CheckpointStorageLocation;
@@ -1425,9 +1425,7 @@ public class CheckpointCoordinator {
 
         // 2. Check regionIdProvider availability
         if (regionIdProvider == null) {
-            LOG.warn(
-                    "Aborting regional checkpoint {} - regionIdProvider not set",
-                    checkpointId);
+            LOG.warn("Aborting regional checkpoint {} - regionIdProvider not set", checkpointId);
             abortPendingCheckpoint(
                     checkpoint,
                     new CheckpointException(
@@ -1535,8 +1533,7 @@ public class CheckpointCoordinator {
         for (ExecutionVertex ev : failedVertices) {
             ev.getJobVertex()
                     .getOperatorIDs()
-                    .forEach(
-                            pair -> failedRegionOperatorIds.add(pair.getGeneratedOperatorID()));
+                    .forEach(pair -> failedRegionOperatorIds.add(pair.getGeneratedOperatorID()));
         }
 
         for (OperatorCoordinatorCheckpointContext coordCtx : coordinatorsToCheckpoint) {
@@ -1593,7 +1590,10 @@ public class CheckpointCoordinator {
                 for (int subtaskIdx : failedSubtasks) {
                     OperatorSubtaskState fallbackState = lastState.getState(subtaskIdx);
                     if (fallbackState != null) {
-                        currentState.putState(subtaskIdx, fallbackState);
+                        currentState.putState(
+                                subtaskIdx,
+                                referenceFallbackState(
+                                        fallbackState, fallbackCheckpointId, checkpointId));
                     }
                 }
             } else if (lastState != null && currentState == null) {
@@ -1609,7 +1609,10 @@ public class CheckpointCoordinator {
                 for (int subtaskIdx : failedSubtasks) {
                     OperatorSubtaskState fallbackState = lastState.getState(subtaskIdx);
                     if (fallbackState != null) {
-                        newState.putState(subtaskIdx, fallbackState);
+                        newState.putState(
+                                subtaskIdx,
+                                referenceFallbackState(
+                                        fallbackState, fallbackCheckpointId, checkpointId));
                     }
                 }
                 currentStates.put(opId, newState);
@@ -1692,7 +1695,9 @@ public class CheckpointCoordinator {
                                 synchronized (lock) {
                                     if (!capturedCheckpoint.isDisposed()) {
                                         completeRegionalCheckpoint(
-                                                capturedCheckpoint, failedVertices, fallbackCheckpointId);
+                                                capturedCheckpoint,
+                                                failedVertices,
+                                                fallbackCheckpointId);
                                     }
                                 }
                             })
@@ -1711,6 +1716,28 @@ public class CheckpointCoordinator {
                                 return null;
                             });
         }
+    }
+
+    /**
+     * Marks a fallback subtask state as referencing the historical checkpoint it originates from,
+     * and registers its shared state under the new checkpoint id.
+     *
+     * <p>The reference id allows the checkpoint cleaner to protect the referenced historical
+     * checkpoint from being subsumed. Re-registering the shared state under the new checkpoint id
+     * ensures the (incremental) shared state files are not deleted when the historical checkpoint
+     * is subsumed, since the failed subtask never sends an acknowledge message for the new
+     * checkpoint.
+     */
+    private OperatorSubtaskState referenceFallbackState(
+            OperatorSubtaskState fallbackState, long fallbackCheckpointId, long checkpointId) {
+        assert (Thread.holdsLock(lock));
+        final OperatorSubtaskState referencedState =
+                fallbackState.toBuilder().setRefCheckpointId(fallbackCheckpointId).build();
+        // Register shared state under the new checkpoint id so it is retained as long as the new
+        // (regional) checkpoint is retained, mirroring the normal acknowledge path.
+        referencedState.registerSharedStates(
+                completedCheckpointStore.getSharedStateRegistry(), checkpointId);
+        return referencedState;
     }
 
     /** Completes a regional checkpoint by finalizing it and notifying only healthy region tasks. */
@@ -1758,15 +1785,16 @@ public class CheckpointCoordinator {
             // Build RegionalCheckpointInfo for coordinators
             final Set<String> fallbackSubtaskIdentifiers = new HashSet<>();
             for (ExecutionVertex ev : failedVertices) {
-                fallbackSubtaskIdentifiers.add(
-                        ev.getTaskNameWithSubtaskIndex() + "#" + ev.getParallelSubtaskIndex());
+                // getTaskNameWithSubtaskIndex() already includes the subtask index.
+                fallbackSubtaskIdentifiers.add(ev.getTaskNameWithSubtaskIndex());
             }
             final Map<Long, Set<String>> fallbackMap = new HashMap<>();
             fallbackMap.put(fallbackCheckpointId, fallbackSubtaskIdentifiers);
             final RegionalCheckpointInfo regionalInfo = new RegionalCheckpointInfo(fallbackMap);
 
-            // Send ack to healthy tasks (task-side notification, no RegionalCheckpointInfo via RPC yet)
-            sendAcknowledgeMessages(
+            // Send ack to healthy region tasks only. Coordinators are notified separately below
+            // with RegionalCheckpointInfo, so we must not notify them here as well.
+            sendAcknowledgeMessagesToTasks(
                     healthyTasks,
                     checkpointId,
                     completedCheckpoint.getTimestamp(),
@@ -2031,17 +2059,31 @@ public class CheckpointCoordinator {
             long completedTimestamp,
             long lastSubsumedCheckpointId) {
         // commit tasks
+        sendAcknowledgeMessagesToTasks(
+                tasksToCommit, completedCheckpointId, completedTimestamp, lastSubsumedCheckpointId);
+
+        // commit coordinators
+        for (OperatorCoordinatorCheckpointContext coordinatorContext : coordinatorsToCheckpoint) {
+            coordinatorContext.notifyCheckpointComplete(completedCheckpointId);
+        }
+    }
+
+    /**
+     * Sends checkpoint-complete notifications to the given tasks only, without notifying operator
+     * coordinators. Used by the regional checkpoint path, which notifies coordinators separately
+     * with {@link RegionalCheckpointInfo}.
+     */
+    private void sendAcknowledgeMessagesToTasks(
+            List<ExecutionVertex> tasksToCommit,
+            long completedCheckpointId,
+            long completedTimestamp,
+            long lastSubsumedCheckpointId) {
         for (ExecutionVertex ev : tasksToCommit) {
             Execution ee = ev.getCurrentExecutionAttempt();
             if (ee != null) {
                 ee.notifyCheckpointOnComplete(
                         completedCheckpointId, completedTimestamp, lastSubsumedCheckpointId);
             }
-        }
-
-        // commit coordinators
-        for (OperatorCoordinatorCheckpointContext coordinatorContext : coordinatorsToCheckpoint) {
-            coordinatorContext.notifyCheckpointComplete(completedCheckpointId);
         }
     }
 

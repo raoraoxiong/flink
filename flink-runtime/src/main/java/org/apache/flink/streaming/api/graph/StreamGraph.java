@@ -406,8 +406,7 @@ public class StreamGraph implements Pipeline, ExecutionPlan {
                                         CheckpointingOptions.REGIONAL_CHECKPOINT_ENABLED))
                         .setRegionalMaxFailureRatio(
                                 jobConfiguration.get(
-                                        CheckpointingOptions
-                                                .REGIONAL_CHECKPOINT_MAX_FAILURE_RATIO))
+                                        CheckpointingOptions.REGIONAL_CHECKPOINT_MAX_FAILURE_RATIO))
                         .setRegionalMaxConsecutiveFailures(
                                 jobConfiguration.get(
                                         CheckpointingOptions
