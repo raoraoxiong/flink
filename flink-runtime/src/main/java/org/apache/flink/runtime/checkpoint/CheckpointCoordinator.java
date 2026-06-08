@@ -30,7 +30,7 @@ import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
 import org.apache.flink.runtime.executiongraph.ExecutionVertex;
-import org.apache.flink.runtime.executiongraph.IntermediateResult;
+import org.apache.flink.runtime.scheduler.strategy.ExecutionVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
@@ -69,6 +69,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -83,6 +84,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -274,6 +276,13 @@ public class CheckpointCoordinator {
     /** Counter tracking consecutive regional checkpoints. */
     private int consecutiveRegionalCheckpointCount = 0;
 
+    /**
+     * Provider that maps an ExecutionVertexID to its pipeline region object. Two vertices returning
+     * the same object (by reference equality) belong to the same pipeline region. Must be set
+     * before regional checkpoint can work.
+     */
+    @Nullable private Function<ExecutionVertexID, Object> regionIdProvider;
+
     // --------------------------------------------------------------------------------------------
 
     public CheckpointCoordinator(
@@ -405,6 +414,14 @@ public class CheckpointCoordinator {
     /** Returns whether regional checkpoint is enabled. */
     public boolean isRegionalCheckpointEnabled() {
         return regionalCheckpointEnabled;
+    }
+
+    /**
+     * Sets the region ID provider used to determine which pipeline region each execution vertex
+     * belongs to. Must be called after the scheduling topology is initialized.
+     */
+    public void setRegionIdProvider(Function<ExecutionVertexID, Object> regionIdProvider) {
+        this.regionIdProvider = regionIdProvider;
     }
 
     /**
@@ -1406,20 +1423,30 @@ public class CheckpointCoordinator {
             attemptToVertex.put(execution.getAttemptId(), execution.getVertex());
         }
 
-        // 2. Compute pipeline regions using union-find over ExecutionJobVertex connectivity
-        final Set<ExecutionJobVertex> allJobVertices = new HashSet<>();
-        for (Execution execution : tasksToWaitFor) {
-            allJobVertices.add(execution.getVertex().getJobVertex());
+        // 2. Check regionIdProvider availability
+        if (regionIdProvider == null) {
+            LOG.warn(
+                    "Aborting regional checkpoint {} - regionIdProvider not set",
+                    checkpointId);
+            abortPendingCheckpoint(
+                    checkpoint,
+                    new CheckpointException(
+                            "RegionIdProvider not set - cannot compute pipeline regions",
+                            CheckpointFailureReason.CHECKPOINT_DECLINED));
+            return;
         }
 
-        final Map<ExecutionJobVertex, Set<ExecutionJobVertex>> regions =
-                computePipelinedRegions(allJobVertices);
+        // 3. Compute region membership for all vertices using subtask-level region objects
+        //    Use IdentityHashMap since region identity is determined by object reference
+        final Map<Object, Set<ExecutionVertex>> regionToVertices = new IdentityHashMap<>();
+        for (Execution execution : tasksToWaitFor) {
+            ExecutionVertex ev = execution.getVertex();
+            Object region = regionIdProvider.apply(ev.getID());
+            regionToVertices.computeIfAbsent(region, k -> new HashSet<>()).add(ev);
+        }
+        final int totalRegions = regionToVertices.size();
 
-        // Compute unique regions (same Set instance may appear as value for multiple keys)
-        final Set<Set<ExecutionJobVertex>> allUniqueRegions = new HashSet<>(regions.values());
-        final int totalRegions = allUniqueRegions.size();
-
-        // 3. If single region → abort (ALL_TO_ALL topology, regional checkpoint not applicable)
+        // 4. If single region → abort (ALL_TO_ALL topology, regional checkpoint not applicable)
         if (totalRegions <= 1) {
             LOG.info(
                     "Aborting regional checkpoint {} - job has only {} pipeline region(s)",
@@ -1433,28 +1460,16 @@ public class CheckpointCoordinator {
             return;
         }
 
-        // 4. Determine failed regions (regions containing at least one declined task)
-        final Set<Set<ExecutionJobVertex>> failedRegions = new HashSet<>();
-        final Map<ExecutionVertex, Set<ExecutionJobVertex>> vertexToRegion = new HashMap<>();
-        for (Set<ExecutionJobVertex> region : regions.values()) {
-            for (ExecutionJobVertex ejv : region) {
-                for (int i = 0; i < ejv.getParallelism(); i++) {
-                    vertexToRegion.put(ejv.getTaskVertices()[i], region);
-                }
-            }
-        }
-
+        // 5. Determine failed regions (regions containing at least one declined task)
+        final Set<Object> failedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
         for (ExecutionAttemptID declinedAttemptId : declinedTasks.keySet()) {
             ExecutionVertex vertex = attemptToVertex.get(declinedAttemptId);
             if (vertex != null) {
-                Set<ExecutionJobVertex> region = vertexToRegion.get(vertex);
-                if (region != null) {
-                    failedRegions.add(region);
-                }
+                failedRegions.add(regionIdProvider.apply(vertex.getID()));
             }
         }
 
-        // 5. Check failure ratio
+        // 6. Check failure ratio
         final double failureRatio = (double) failedRegions.size() / totalRegions;
         if (failureRatio > regionalMaxFailureRatio) {
             LOG.info(
@@ -1475,7 +1490,7 @@ public class CheckpointCoordinator {
             return;
         }
 
-        // 6. Check consecutive limit
+        // 7. Check consecutive limit
         if (consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures) {
             LOG.info(
                     "Aborting regional checkpoint {} - consecutive count {} >= max {}",
@@ -1491,7 +1506,7 @@ public class CheckpointCoordinator {
             return;
         }
 
-        // 7. Get last completed checkpoint for fallback state
+        // 8. Get last completed checkpoint for fallback state
         final CompletedCheckpoint lastCompleted = completedCheckpointStore.getLatestCheckpoint();
         if (lastCompleted == null) {
             LOG.info(
@@ -1506,24 +1521,22 @@ public class CheckpointCoordinator {
         }
         final long fallbackCheckpointId = lastCompleted.getCheckpointID();
 
-        // 8. Determine failed subtask IDs and check coordinator support
+        // 9. Collect all vertices in failed regions
         final Set<ExecutionVertex> failedVertices = new HashSet<>();
-        for (Set<ExecutionJobVertex> failedRegion : failedRegions) {
-            for (ExecutionJobVertex ejv : failedRegion) {
-                for (int i = 0; i < ejv.getParallelism(); i++) {
-                    failedVertices.add(ejv.getTaskVertices()[i]);
-                }
+        for (Object failedRegion : failedRegions) {
+            Set<ExecutionVertex> regionVertices = regionToVertices.get(failedRegion);
+            if (regionVertices != null) {
+                failedVertices.addAll(regionVertices);
             }
         }
 
-        // Collect operator IDs in failed regions and check coordinator support
+        // 10. Collect operator IDs in failed regions and check coordinator support
         final Set<OperatorID> failedRegionOperatorIds = new HashSet<>();
-        for (Set<ExecutionJobVertex> failedRegion : failedRegions) {
-            for (ExecutionJobVertex ejv : failedRegion) {
-                ejv.getOperatorIDs()
-                        .forEach(
-                                pair -> failedRegionOperatorIds.add(pair.getGeneratedOperatorID()));
-            }
+        for (ExecutionVertex ev : failedVertices) {
+            ev.getJobVertex()
+                    .getOperatorIDs()
+                    .forEach(
+                            pair -> failedRegionOperatorIds.add(pair.getGeneratedOperatorID()));
         }
 
         for (OperatorCoordinatorCheckpointContext coordCtx : coordinatorsToCheckpoint) {
@@ -1790,44 +1803,6 @@ public class CheckpointCoordinator {
      *
      * @return a map from each ExecutionJobVertex to its region (a Set of ExecutionJobVertex)
      */
-    private Map<ExecutionJobVertex, Set<ExecutionJobVertex>> computePipelinedRegions(
-            Set<ExecutionJobVertex> jobVertices) {
-        // Union-find: each vertex starts in its own set
-        final Map<ExecutionJobVertex, Set<ExecutionJobVertex>> vertexToRegion = new HashMap<>();
-        for (ExecutionJobVertex jv : jobVertices) {
-            Set<ExecutionJobVertex> region = new HashSet<>();
-            region.add(jv);
-            vertexToRegion.put(jv, region);
-        }
-
-        // Merge regions connected by pipelined edges
-        for (ExecutionJobVertex jv : jobVertices) {
-            for (IntermediateResult input : jv.getInputs()) {
-                if (input.getResultType().mustBePipelinedConsumed()) {
-                    ExecutionJobVertex producer = input.getProducer();
-                    if (jobVertices.contains(producer)) {
-                        Set<ExecutionJobVertex> currentRegion = vertexToRegion.get(jv);
-                        Set<ExecutionJobVertex> producerRegion = vertexToRegion.get(producer);
-                        if (currentRegion != producerRegion) {
-                            // Merge: add all from smaller to larger
-                            if (currentRegion.size() < producerRegion.size()) {
-                                Set<ExecutionJobVertex> temp = currentRegion;
-                                currentRegion = producerRegion;
-                                producerRegion = temp;
-                            }
-                            currentRegion.addAll(producerRegion);
-                            for (ExecutionJobVertex moved : producerRegion) {
-                                vertexToRegion.put(moved, currentRegion);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return vertexToRegion;
-    }
-
     /**
      * Try to complete the given pending checkpoint.
      *

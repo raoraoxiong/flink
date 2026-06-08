@@ -887,6 +887,13 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
 
         partitionGroupReleaseStrategy =
                 partitionGroupReleaseStrategyFactory.createInstance(getSchedulingTopology());
+
+        // Wire region ID provider into CheckpointCoordinator for Regional Checkpoint support
+        if (checkpointCoordinator != null && checkpointCoordinator.isRegionalCheckpointEnabled()) {
+            final var topology = executionTopology;
+            checkpointCoordinator.setRegionIdProvider(
+                    vertexId -> topology.getPipelinedRegionOfVertex(vertexId));
+        }
     }
 
     @Override
