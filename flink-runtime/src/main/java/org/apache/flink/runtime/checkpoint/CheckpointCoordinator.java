@@ -1654,29 +1654,38 @@ public class CheckpointCoordinator {
                     }
 
                     final OperatorID opId = coordCtx.operatorId();
+                    final int coordParallelism = coordCtx.currentParallelism();
+                    final int coordMaxParallelism = coordCtx.maxParallelism();
                     coordinatorFutures.add(
-                            resultFuture
-                                    .thenAccept(
-                                            bytes -> {
-                                                synchronized (lock) {
-                                                    OperatorState state = currentStates.get(opId);
-                                                    if (state != null) {
-                                                        state.setCoordinatorState(
-                                                                new ByteStreamStateHandle(
-                                                                        "regionFallback-" + opId,
-                                                                        bytes));
-                                                    }
-                                                }
-                                            })
-                                    .exceptionally(
-                                            t -> {
-                                                LOG.warn(
-                                                        "Region fallback coordinator state "
-                                                                + "failed for {}",
-                                                        opId,
-                                                        t);
-                                                return null;
-                                            }));
+                            resultFuture.thenAccept(
+                                    bytes -> {
+                                        synchronized (lock) {
+                                            final ByteStreamStateHandle coordinatorStateHandle =
+                                                    new ByteStreamStateHandle(
+                                                            "regionFallback-" + opId, bytes);
+                                            OperatorState state = currentStates.get(opId);
+                                            if (state == null) {
+                                                // All subtasks of this operator were in the failed
+                                                // region and had no historical state, so no
+                                                // OperatorState was created during state merge.
+                                                // Create one now so the coordinator fallback state
+                                                // is not silently dropped.
+                                                state =
+                                                        new OperatorState(
+                                                                null,
+                                                                null,
+                                                                opId,
+                                                                coordParallelism,
+                                                                coordMaxParallelism);
+                                                currentStates.put(opId, state);
+                                            }
+                                            // Overwrite rather than set: the coordinator may have
+                                            // already produced state during the failed regional
+                                            // attempt, which must be replaced by the historical
+                                            // fallback state.
+                                            state.overwriteCoordinatorState(coordinatorStateHandle);
+                                        }
+                                    }));
                 }
             }
         }

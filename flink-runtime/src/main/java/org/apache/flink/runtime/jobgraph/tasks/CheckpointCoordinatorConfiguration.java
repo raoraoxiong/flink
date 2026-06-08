@@ -269,7 +269,10 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 && tolerableCheckpointFailureNumber == that.tolerableCheckpointFailureNumber
                 && checkpointIdOfIgnoredInFlightData == that.checkpointIdOfIgnoredInFlightData
                 && enableCheckpointsAfterTasksFinish == that.enableCheckpointsAfterTasksFinish
-                && recoverOutputOnDownstreamTask == that.recoverOutputOnDownstreamTask;
+                && recoverOutputOnDownstreamTask == that.recoverOutputOnDownstreamTask
+                && regionalCheckpointEnabled == that.regionalCheckpointEnabled
+                && Double.compare(regionalMaxFailureRatio, that.regionalMaxFailureRatio) == 0
+                && regionalMaxConsecutiveFailures == that.regionalMaxConsecutiveFailures;
     }
 
     @Override
@@ -286,7 +289,10 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 tolerableCheckpointFailureNumber,
                 checkpointIdOfIgnoredInFlightData,
                 enableCheckpointsAfterTasksFinish,
-                recoverOutputOnDownstreamTask);
+                recoverOutputOnDownstreamTask,
+                regionalCheckpointEnabled,
+                regionalMaxFailureRatio,
+                regionalMaxConsecutiveFailures);
     }
 
     @Override
@@ -316,6 +322,12 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 + enableCheckpointsAfterTasksFinish
                 + ", recoverOutputOnDownstreamTask="
                 + recoverOutputOnDownstreamTask
+                + ", regionalCheckpointEnabled="
+                + regionalCheckpointEnabled
+                + ", regionalMaxFailureRatio="
+                + regionalMaxFailureRatio
+                + ", regionalMaxConsecutiveFailures="
+                + regionalMaxConsecutiveFailures
                 + '}';
     }
 
