@@ -943,6 +943,8 @@ public class CheckpointCoordinatorTestingUtils {
         private BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator = null;
         private Runnable onCallingAbortCurrentTriggering = null;
         private OperatorID operatorID = null;
+        private boolean supportsRegionCheckpoint = false;
+        private RegionFallbackHandler onCallingCheckpointCoordinatorForRegionFallback = null;
 
         public MockOperatorCheckpointCoordinatorContextBuilder setOnCallingCheckpointCoordinator(
                 BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator) {
@@ -962,10 +964,39 @@ public class CheckpointCoordinatorTestingUtils {
             return this;
         }
 
+        public MockOperatorCheckpointCoordinatorContextBuilder setSupportsRegionCheckpoint(
+                boolean supportsRegionCheckpoint) {
+            this.supportsRegionCheckpoint = supportsRegionCheckpoint;
+            return this;
+        }
+
+        public MockOperatorCheckpointCoordinatorContextBuilder
+                setOnCallingCheckpointCoordinatorForRegionFallback(
+                        RegionFallbackHandler onCallingCheckpointCoordinatorForRegionFallback) {
+            this.onCallingCheckpointCoordinatorForRegionFallback =
+                    onCallingCheckpointCoordinatorForRegionFallback;
+            return this;
+        }
+
         public MockOperatorCoordinatorCheckpointContext build() {
             return new MockOperatorCoordinatorCheckpointContext(
-                    onCallingCheckpointCoordinator, onCallingAbortCurrentTriggering, operatorID);
+                    onCallingCheckpointCoordinator,
+                    onCallingAbortCurrentTriggering,
+                    operatorID,
+                    supportsRegionCheckpoint,
+                    onCallingCheckpointCoordinatorForRegionFallback);
         }
+    }
+
+    /** Callback for the regional fallback path of a mock coordinator context. */
+    @FunctionalInterface
+    public interface RegionFallbackHandler {
+        void handle(
+                long checkpointId,
+                long fallbackCheckpointId,
+                Set<Integer> fallbackSubtaskIds,
+                CompletableFuture<byte[]> resultFuture)
+                throws Exception;
     }
 
     // ----------------- Mock classes --------------------
@@ -979,18 +1010,27 @@ public class CheckpointCoordinatorTestingUtils {
         private final BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator;
         private final Runnable onCallingAbortCurrentTriggering;
         private final OperatorID operatorID;
+        private final boolean supportsRegionCheckpoint;
+        private final RegionFallbackHandler onCallingCheckpointCoordinatorForRegionFallback;
         private final List<Long> completedCheckpoints;
         private final List<Long> abortedCheckpoints;
+        private final List<Long> regionalCompletedCheckpoints;
 
         private MockOperatorCoordinatorCheckpointContext(
                 BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator,
                 Runnable onCallingAbortCurrentTriggering,
-                OperatorID operatorID) {
+                OperatorID operatorID,
+                boolean supportsRegionCheckpoint,
+                RegionFallbackHandler onCallingCheckpointCoordinatorForRegionFallback) {
             this.onCallingCheckpointCoordinator = onCallingCheckpointCoordinator;
             this.onCallingAbortCurrentTriggering = onCallingAbortCurrentTriggering;
             this.operatorID = operatorID;
+            this.supportsRegionCheckpoint = supportsRegionCheckpoint;
+            this.onCallingCheckpointCoordinatorForRegionFallback =
+                    onCallingCheckpointCoordinatorForRegionFallback;
             this.completedCheckpoints = new ArrayList<>();
             this.abortedCheckpoints = new ArrayList<>();
+            this.regionalCompletedCheckpoints = new ArrayList<>();
         }
 
         @Override
@@ -1014,6 +1054,13 @@ public class CheckpointCoordinatorTestingUtils {
         }
 
         @Override
+        public void notifyCheckpointComplete(
+                long checkpointId, org.apache.flink.api.common.state.RegionalCheckpointInfo info) {
+            regionalCompletedCheckpoints.add(checkpointId);
+            completedCheckpoints.add(checkpointId);
+        }
+
+        @Override
         public void notifyCheckpointAborted(long checkpointId) {
             abortedCheckpoints.add(checkpointId);
         }
@@ -1024,6 +1071,26 @@ public class CheckpointCoordinatorTestingUtils {
 
         @Override
         public void subtaskReset(int subtask, long checkpointId) {}
+
+        @Override
+        public boolean supportsRegionCheckpoint() {
+            return supportsRegionCheckpoint;
+        }
+
+        @Override
+        public void checkpointCoordinatorForRegionFallback(
+                long checkpointId,
+                long fallbackCheckpointId,
+                Set<Integer> fallbackSubtaskIds,
+                CompletableFuture<byte[]> resultFuture)
+                throws Exception {
+            if (onCallingCheckpointCoordinatorForRegionFallback != null) {
+                onCallingCheckpointCoordinatorForRegionFallback.handle(
+                        checkpointId, fallbackCheckpointId, fallbackSubtaskIds, resultFuture);
+            } else {
+                resultFuture.complete(new byte[0]);
+            }
+        }
 
         @Override
         public OperatorID operatorId() {
@@ -1046,6 +1113,10 @@ public class CheckpointCoordinatorTestingUtils {
 
         public List<Long> getAbortedCheckpoints() {
             return abortedCheckpoints;
+        }
+
+        public List<Long> getRegionalCompletedCheckpoints() {
+            return regionalCompletedCheckpoints;
         }
     }
 }
