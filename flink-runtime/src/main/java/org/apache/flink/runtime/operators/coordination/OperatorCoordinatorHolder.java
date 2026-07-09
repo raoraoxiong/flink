@@ -294,18 +294,31 @@ public class OperatorCoordinatorHolder
     }
 
     @Override
-    public void notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
+    public void notifyRegionalCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
         mainThreadExecutor.execute(
                 () -> {
                     subtaskGatewayMap
                             .values()
                             .forEach(x -> x.openGatewayAndUnmarkCheckpoint(checkpointId));
                     try {
-                        coordinator.notifyCheckpointComplete(checkpointId, info);
+                        coordinator.notifyRegionalCheckpointComplete(checkpointId, info);
                     } catch (Exception e) {
                         throw new RuntimeException(
-                                "Exception in notifyCheckpointComplete with RegionalCheckpointInfo",
-                                e);
+                                "Exception in notifyRegionalCheckpointComplete", e);
+                    }
+                });
+    }
+
+    @Override
+    public void notifyRegionalCheckpointFallback(long checkpointId, long fallbackCheckpointId) {
+        mainThreadExecutor.execute(
+                () -> {
+                    try {
+                        coordinator.notifyRegionalCheckpointFallback(
+                                checkpointId, fallbackCheckpointId);
+                    } catch (Exception e) {
+                        throw new RuntimeException(
+                                "Exception in notifyRegionalCheckpointFallback", e);
                     }
                 });
     }

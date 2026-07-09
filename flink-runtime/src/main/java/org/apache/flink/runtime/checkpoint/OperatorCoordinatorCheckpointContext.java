@@ -49,10 +49,23 @@ public interface OperatorCoordinatorCheckpointContext extends OperatorInfo, Chec
 
     /**
      * Notifies the coordinator that a regional checkpoint has completed, providing context about
-     * which subtasks used historical state.
+     * which subtasks used historical state. Default implementation delegates to {@link
+     * #notifyCheckpointComplete(long)}.
      */
-    default void notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
+    @Override
+    default void notifyRegionalCheckpointComplete(
+            long checkpointId, RegionalCheckpointInfo regionalCheckpointInfo) throws Exception {
         notifyCheckpointComplete(checkpointId);
+    }
+
+    /**
+     * Notifies the coordinator that a regional checkpoint has completed but some subtasks fell back
+     * to a historical checkpoint. Default is no-op; coordinators that maintain local state should
+     * override to clean up stale state for the fallback subtasks.
+     */
+    @Override
+    default void notifyRegionalCheckpointFallback(long checkpointId, long fallbackCheckpointId) {
+        // no-op for backward compatibility
     }
 
     /**

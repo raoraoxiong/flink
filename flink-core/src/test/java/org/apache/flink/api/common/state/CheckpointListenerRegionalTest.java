@@ -67,7 +67,7 @@ class CheckpointListenerRegionalTest {
         fallback.put(99L, Set.of("Source#0"));
         RegionalCheckpointInfo info = new RegionalCheckpointInfo(fallback);
 
-        listener.notifyCheckpointComplete(100L, info);
+        listener.notifyRegionalCheckpointComplete(100L, info);
         assertThat(receivedId.get()).isEqualTo(100L);
     }
 
@@ -81,7 +81,7 @@ class CheckpointListenerRegionalTest {
                     public void notifyCheckpointComplete(long checkpointId) {}
 
                     @Override
-                    public void notifyCheckpointComplete(
+                    public void notifyRegionalCheckpointComplete(
                             long checkpointId, RegionalCheckpointInfo info) {
                         wasRegional.set(!info.isGlobalCheckpoint());
                     }
@@ -89,11 +89,45 @@ class CheckpointListenerRegionalTest {
 
         Map<Long, Set<String>> fallback = new HashMap<>();
         fallback.put(99L, Set.of("Source#0"));
-        listener.notifyCheckpointComplete(100L, new RegionalCheckpointInfo(fallback));
+        listener.notifyRegionalCheckpointComplete(100L, new RegionalCheckpointInfo(fallback));
         assertThat(wasRegional.get()).isTrue();
 
-        listener.notifyCheckpointComplete(101L, RegionalCheckpointInfo.globalCheckpoint());
+        listener.notifyRegionalCheckpointComplete(101L, RegionalCheckpointInfo.globalCheckpoint());
         assertThat(wasRegional.get()).isFalse();
+    }
+
+    @Test
+    void testNotifyRegionalCheckpointFallbackDefaultNoOp() {
+        // Default implementation should be no-op and not throw
+        CheckpointListener listener =
+                new CheckpointListener() {
+                    @Override
+                    public void notifyCheckpointComplete(long checkpointId) {}
+                };
+        listener.notifyRegionalCheckpointFallback(100L, 99L);
+    }
+
+    @Test
+    void testNotifyRegionalCheckpointFallbackOverridden() {
+        AtomicLong receivedCheckpointId = new AtomicLong(-1);
+        AtomicLong receivedFallbackId = new AtomicLong(-1);
+
+        CheckpointListener listener =
+                new CheckpointListener() {
+                    @Override
+                    public void notifyCheckpointComplete(long checkpointId) {}
+
+                    @Override
+                    public void notifyRegionalCheckpointFallback(
+                            long checkpointId, long fallbackCheckpointId) {
+                        receivedCheckpointId.set(checkpointId);
+                        receivedFallbackId.set(fallbackCheckpointId);
+                    }
+                };
+
+        listener.notifyRegionalCheckpointFallback(100L, 99L);
+        assertThat(receivedCheckpointId.get()).isEqualTo(100L);
+        assertThat(receivedFallbackId.get()).isEqualTo(99L);
     }
 
     @Test

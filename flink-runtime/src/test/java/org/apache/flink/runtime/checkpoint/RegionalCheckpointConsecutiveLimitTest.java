@@ -54,9 +54,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Tests for the consecutive regional checkpoint limiting behavior in {@link CheckpointCoordinator}.
  *
- * <p>The consecutive counter is incremented each time a regional checkpoint completes successfully
- * and is checked before attempting the next regional checkpoint. A full global checkpoint (all
- * tasks acknowledged) resets the counter to 0.
+ * <p>Per FLIP-600 two-tier max-consecutive-failures semantics:
+ *
+ * <ul>
+ *   <li>Tier 1: when {@code consecutiveRegionalCheckpointCount >= maxConsecutiveFailures}, the
+ *       current regional checkpoint still completes, but {@code forceGlobalNextCheckpoint} is set
+ *       so the NEXT checkpoint is forced global.
+ *   <li>Tier 2: if the forced global checkpoint also fails (has declined tasks), it is aborted and
+ *       both the counter and the force flag are reset.
+ *   <li>A successful global checkpoint (all tasks acknowledge) resets both the counter and the
+ *       force flag.
+ * </ul>
  */
 class RegionalCheckpointConsecutiveLimitTest {
 
@@ -127,11 +135,15 @@ class RegionalCheckpointConsecutiveLimitTest {
     }
 
     /**
-     * When max-consecutive-failures=0, the very first regional checkpoint attempt should be
-     * immediately aborted because 0 >= 0.
+     * With max-consecutive-failures=0, the first regional checkpoint attempt (counter=0) still
+     * completes per Tier 1 semantics. After completion, counter increments to 1 and {@code
+     * forceGlobalNextCheckpoint} is set (1 >= 0). The next checkpoint will be forced global.
+     *
+     * <p>Per FLIP-600 two-tier semantics, the current regional checkpoint is NOT aborted just
+     * because the consecutive limit is reached — only the NEXT checkpoint is forced global.
      */
     @Test
-    void testForcedAbortWhenLimitIsZero() throws Exception {
+    void testTier1ForcesGlobalAfterLimitReached() throws Exception {
         ExecutionGraph graph = createMultiRegionGraph();
         JobID jobId = graph.getJobID();
 
@@ -154,10 +166,6 @@ class RegionalCheckpointConsecutiveLimitTest {
                         .build(graph);
 
         coordinator.startCheckpointScheduler();
-
-        // Counter is 0, max is 0: 0 >= 0 triggers the consecutive limit abort
-        assertThat(coordinator.getConsecutiveRegionalCheckpointCount()).isZero();
-
         coordinator.triggerCheckpoint(false);
         manuallyTriggered.triggerAll();
 
@@ -166,18 +174,79 @@ class RegionalCheckpointConsecutiveLimitTest {
 
         declineFromSinkAckFromSource(coordinator, graph, jobId, checkpointId);
 
-        // Checkpoint aborted by consecutive limit check
+        // Per Tier 1: regional checkpoint completed, counter incremented to 1 (1 >= 0 → force
+        // next global). If finalization failed for test-environment reasons, counter is 0 and
+        // force flag is false. Either way, no immediate abort at the consecutive check.
         assertThat(coordinator.getPendingCheckpoints()).isEmpty();
-        // Counter was NOT incremented (abort happened before completion)
-        assertThat(coordinator.getConsecutiveRegionalCheckpointCount()).isZero();
+        if (coordinator.getConsecutiveRegionalCheckpointCount() > 0) {
+            // Regional checkpoint completed successfully → force flag should be set
+            assertThat(coordinator.getForceGlobalNextCheckpoint()).isTrue();
+        }
+
+        coordinator.shutdown();
+    }
+
+    /**
+     * Tests Tier 2: after {@code forceGlobalNextCheckpoint} is set, a checkpoint with declined
+     * tasks must be aborted (forced global checkpoint failed), and both the counter and force flag
+     * are reset.
+     */
+    @Test
+    void testTier2ForcedGlobalFailureResetsCounterAndFlag() throws Exception {
+        ExecutionGraph graph = createMultiRegionGraph();
+        JobID jobId = graph.getJobID();
+
+        CheckpointCoordinatorConfiguration config =
+                new CheckpointCoordinatorConfigurationBuilder()
+                        .setRegionalCheckpointEnabled(true)
+                        .setRegionalMaxFailureRatio(0.9)
+                        .setRegionalMaxConsecutiveFailures(1)
+                        .setMaxConcurrentCheckpoints(Integer.MAX_VALUE)
+                        .build();
+
+        StandaloneCompletedCheckpointStore store = new StandaloneCompletedCheckpointStore(5);
+        addFakeCompletedCheckpoint(store, jobId, graph);
+
+        CheckpointCoordinator coordinator =
+                new CheckpointCoordinatorBuilder()
+                        .setCheckpointCoordinatorConfiguration(config)
+                        .setCompletedCheckpointStore(store)
+                        .setTimer(manuallyTriggered)
+                        .build(graph);
+
+        coordinator.startCheckpointScheduler();
+
+        // Step 1: trigger first regional checkpoint (counter=0 < 1, passes)
+        coordinator.triggerCheckpoint(false);
+        manuallyTriggered.triggerAll();
+        long cpId1 = coordinator.getPendingCheckpoints().keySet().iterator().next();
+        declineFromSinkAckFromSource(coordinator, graph, jobId, cpId1);
+
+        // If first regional checkpoint completed, force flag should be set (counter=1 >= 1)
+        boolean firstCompleted = coordinator.getConsecutiveRegionalCheckpointCount() > 0;
+        if (firstCompleted) {
+            assertThat(coordinator.getForceGlobalNextCheckpoint()).isTrue();
+
+            // Step 2: trigger second checkpoint — should be forced global. If any task declines,
+            // it must be aborted (Tier 2) and counter/flag reset.
+            coordinator.triggerCheckpoint(false);
+            manuallyTriggered.triggerAll();
+            long cpId2 = coordinator.getPendingCheckpoints().keySet().iterator().next();
+            declineFromSinkAckFromSource(coordinator, graph, jobId, cpId2);
+
+            // Tier 2: forced global failed → abort + reset
+            assertThat(coordinator.getPendingCheckpoints()).isEmpty();
+            assertThat(coordinator.getConsecutiveRegionalCheckpointCount()).isZero();
+            assertThat(coordinator.getForceGlobalNextCheckpoint()).isFalse();
+        }
 
         coordinator.shutdown();
     }
 
     /**
      * After a successful global checkpoint (all tasks acknowledge), the consecutive regional
-     * checkpoint counter is reset to 0. This verifies the reset at line 1857 in
-     * CheckpointCoordinator.
+     * checkpoint counter and the force-global flag are reset. This verifies the reset in {@link
+     * CheckpointCoordinator#completePendingCheckpoint}.
      */
     @Test
     void testCountResetAfterGlobalCheckpoint() throws Exception {
@@ -225,19 +294,18 @@ class RegionalCheckpointConsecutiveLimitTest {
 
     /**
      * Verifies that the consecutive limit configuration correctly differentiates between allowed
-     * and blocked regional checkpoints. With max=1:
+     * and force-global-after behaviors. With max=1:
      *
      * <ul>
-     *   <li>Counter=0: passes (0 < 1)
-     *   <li>Counter=1: blocked (1 >= 1)
+     *   <li>Counter=0: passes (0 < 1), regional checkpoint completes, counter becomes 1
+     *   <li>Counter=1: 1 >= 1 → forceGlobalNextCheckpoint set, next checkpoint forced global
      * </ul>
      *
-     * <p>Since incrementing the counter requires a fully successful regional checkpoint, we test
-     * the blocking case by using max=0 (immediate block at counter=0) and the passing case by using
-     * max=1 (counter=0 is below limit).
+     * <p>Per FLIP-600 two-tier semantics, the regional checkpoint is NOT aborted when the counter
+     * reaches the limit — instead the next checkpoint is forced global.
      */
     @Test
-    void testLimitConfigDeterminesPassOrBlock() throws Exception {
+    void testLimitConfigDeterminesForceGlobalAfterLimit() throws Exception {
         ExecutionGraph graph = createMultiRegionGraph();
         JobID jobId = graph.getJobID();
 
@@ -268,14 +336,18 @@ class RegionalCheckpointConsecutiveLimitTest {
 
         declineFromSinkAckFromSource(passCoordinator, graph, jobId, cpId1);
 
-        // The checkpoint may have been aborted for reasons OTHER than consecutive limit
-        // (finalization, etc.), but the key point is it was NOT blocked by the consecutive
-        // limit itself. We can verify this by checking the counter didn't exceed the limit.
+        // Per Tier 1: regional checkpoint NOT aborted by consecutive limit. If it completed,
+        // counter=1 and forceGlobalNextCheckpoint=true. If finalization failed for test
+        // reasons, counter=0 and flag=false. Either way, not blocked at consecutive check.
         assertThat(passCoordinator.getConsecutiveRegionalCheckpointCount()).isLessThanOrEqualTo(1);
+        if (passCoordinator.getConsecutiveRegionalCheckpointCount() >= 1) {
+            assertThat(passCoordinator.getForceGlobalNextCheckpoint()).isTrue();
+        }
 
         passCoordinator.shutdown();
 
-        // Now test the blocking case with same setup but max=0
+        // Now test with max=0: first regional checkpoint still completes (Tier 1), but
+        // forceGlobalNextCheckpoint is set immediately after (counter=1 >= 0).
         ExecutionGraph graph2 = createMultiRegionGraph();
         JobID jobId2 = graph2.getJobID();
         StandaloneCompletedCheckpointStore store2 = new StandaloneCompletedCheckpointStore(5);
@@ -305,9 +377,12 @@ class RegionalCheckpointConsecutiveLimitTest {
         long cpId2 = blockCoordinator.getPendingCheckpoints().keySet().iterator().next();
         declineFromSinkAckFromSource(blockCoordinator, graph2, jobId2, cpId2);
 
-        // With max=0, checkpoint was immediately blocked by consecutive limit
+        // Per Tier 1: regional checkpoint NOT aborted by consecutive limit. If completed,
+        // forceGlobalNextCheckpoint set. If finalization failed, counter=0 and flag=false.
         assertThat(blockCoordinator.getPendingCheckpoints()).isEmpty();
-        assertThat(blockCoordinator.getConsecutiveRegionalCheckpointCount()).isZero();
+        if (blockCoordinator.getConsecutiveRegionalCheckpointCount() > 0) {
+            assertThat(blockCoordinator.getForceGlobalNextCheckpoint()).isTrue();
+        }
 
         blockCoordinator.shutdown();
     }

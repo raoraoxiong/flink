@@ -37,12 +37,17 @@ This is especially useful for AI data processing workloads (e.g., model inferenc
 Flink's existing checkpoint mechanism requires all tasks to successfully acknowledge before a checkpoint can be completed. With Regional Checkpoint enabled:
 
 1. When a task declines a checkpoint, the CheckpointCoordinator buffers the decline instead of immediately aborting.
-2. After all tasks have responded, the coordinator determines which Pipeline Regions have failed.
+2. After all tasks have responded (or the checkpoint timeout fires), the coordinator determines which Pipeline Regions have failed.
 3. If the failure ratio is within the configured threshold, the coordinator assembles a combined checkpoint:
    - **Healthy regions**: use the current checkpoint state
    - **Failed regions**: use state from the last successful checkpoint
 4. OperatorCoordinators that support Regional Checkpoint perform state correction to maintain consistency.
-5. Only healthy region tasks receive `notifyCheckpointComplete`.
+5. Healthy region tasks receive `notifyRegionalCheckpointComplete` (which by default delegates to `notifyCheckpointComplete`).
+6. Failed region tasks receive `notifyRegionalCheckpointFallback` so they can clean up stale local state from the failed attempt.
+
+### Per-Region Timeout Handling
+
+When a task neither acknowledges nor declines within the checkpoint timeout, the timeout fires and the unacknowledged task's region is treated as failed (identical to the decline path). If the failure ratio is within `max-failure-ratio`, the coordinator proceeds with Regional Checkpoint. This counts toward `max-consecutive-failures`. The standard `execution.checkpointing.timeout` applies uniformly; no per-region timeout configuration is introduced.
 
 ## Prerequisites
 
@@ -54,7 +59,7 @@ Regional Checkpoint only works with **POINTWISE** topologies (forward, rescale c
 |-----|------|---------|-------------|
 | `execution.checkpointing.region.enabled` | Boolean | `false` | Global switch for Regional Checkpoint. |
 | `execution.checkpointing.region.max-failure-ratio` | Double | `0.3` | Maximum ratio of failed regions allowed in a single checkpoint. If exceeded, the checkpoint aborts. |
-| `execution.checkpointing.region.max-consecutive-failures` | Integer | `2` | Maximum number of consecutive checkpoints that may reference historical state. When exceeded, the next checkpoint is forced to be a global checkpoint. |
+| `execution.checkpointing.region.max-consecutive-failures` | Integer | `2` | Maximum number of consecutive checkpoints that may reference historical state. When the limit is reached, the current regional checkpoint still completes, but the **next** checkpoint is forced to be global (Tier 1). If the forced global checkpoint also fails, it aborts and the counter resets (Tier 2). |
 
 ### Example
 
@@ -70,7 +75,7 @@ execution.checkpointing.region.max-consecutive-failures: 3
 
 | Metric | Description |
 |--------|-------------|
-| `regionalCheckpointCount` | Cumulative count of completed Regional Checkpoints. |
+| `regional_checkpoint_count` | Cumulative count of completed Regional Checkpoints (Counter). |
 
 ### REST API
 
@@ -90,21 +95,22 @@ The Checkpoint configuration page displays Regional Checkpoint settings. The Che
 ## Detecting Regional Checkpoints in User Code
 
 A regional checkpoint is still a logically complete, committed checkpoint, so it is delivered through the
-regular `notifyCheckpointComplete` path. User code that needs to distinguish a global checkpoint from a
+regular checkpoint-complete path. User code that needs to distinguish a global checkpoint from a
 regional one (for example, an exactly-once sink that wants to know whether some subtasks fell back to
 historical state) can observe this context via the `RegionalCheckpointInfo` provided by the framework.
 
 `RegionalCheckpointInfo` is intentionally exposed at the user-facing API boundary (`flink-core`); the
-runtime does not require any operator to consume it. There are two entry points:
+runtime does not require any operator to consume it. Per FLIP-600, there are two notification methods
+on `CheckpointListener`:
 
-* **`CheckpointListener`** — implement the default method
-  `notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info)`. The default implementation
-  delegates to `notifyCheckpointComplete(long)`, so existing implementations are unaffected and only
-  opt in when they override it.
+* **`notifyRegionalCheckpointComplete(long checkpointId, RegionalCheckpointInfo info)`** — called on
+  **healthy-region tasks** when a checkpoint completes. The default implementation delegates to
+  `notifyCheckpointComplete(long)`, so existing implementations are unaffected and only opt in when
+  they override it.
 
   ```java
   @Override
-  public void notifyCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
+  public void notifyRegionalCheckpointComplete(long checkpointId, RegionalCheckpointInfo info) {
       if (info.isGlobalCheckpoint()) {
           // all tasks acknowledged the current checkpoint
       } else {
@@ -114,8 +120,25 @@ runtime does not require any operator to consume it. There are two entry points:
   }
   ```
 
-* **`OperatorCoordinator`** — coordinators receive the same `RegionalCheckpointInfo` when the regional
-  checkpoint completes, which is the natural place to coordinate cross-subtask commit logic.
+* **`notifyRegionalCheckpointFallback(long checkpointId, long fallbackCheckpointId)`** — called on
+  **failed-region tasks** when a regional checkpoint completes but this task's region fell back to
+  a historical checkpoint. This is delivered via the same task-side checkpoint-complete RPC path so
+  it survives task restarts and is applied after the task recovers. Implementations that maintain
+  local checkpoint state (e.g. `TaskLocalStateStore`) should override this method to discard the
+  stale local state of the failed checkpoint attempt. The default implementation is no-op.
+
+  ```java
+  @Override
+  public void notifyRegionalCheckpointFallback(long checkpointId, long fallbackCheckpointId) {
+      // clean up stale local state from the failed checkpoint attempt
+  }
+  ```
+
+* **`OperatorCoordinator`** — coordinators in healthy regions receive
+  `notifyRegionalCheckpointComplete` with the same `RegionalCheckpointInfo`; coordinators in failed
+  regions receive `notifyRegionalCheckpointFallback` so they can clean up coordinator-side state
+  from the failed attempt (in addition to the state correction already performed via
+  `checkpointCoordinatorForRegionFallback`).
 
 For a regional checkpoint, `RegionalCheckpointInfo#isGlobalCheckpoint()` returns `false` and
 `getFallbackCheckpointIds()` lists the historical checkpoint ids whose state was reused. For a global
@@ -123,10 +146,13 @@ checkpoint it returns `true` with an empty fallback set.
 
 ## Limitations
 
-1. **POINTWISE topologies only**: Jobs with ALL_TO_ALL edges (keyBy, rebalance) form a single region and cannot benefit from this feature.
+1. **POINTWISE topologies only**: Jobs with ALL_TO_ALL edges (keyBy, rebalance, hash, shuffle) form a single Pipeline Region and cannot benefit from this feature. Regional Checkpoint automatically falls back to standard checkpoint behavior in this case.
 2. **OperatorCoordinator support**: If an OperatorCoordinator in a failed region does not declare `supportsRegionCheckpoint() = true`, the checkpoint will abort. Flink's built-in `SourceCoordinator` supports Regional Checkpoint.
-3. **Consecutive limit**: To prevent unbounded historical checkpoint accumulation, the system forces a global checkpoint after `max-consecutive-failures` consecutive regional checkpoints.
+3. **Consecutive limit (two-tier semantics)**: To prevent unbounded historical checkpoint accumulation, the system forces a global checkpoint after `max-consecutive-failures` consecutive regional checkpoints. The two-tier behavior is:
+   - **Tier 1**: When the consecutive count reaches the limit, the current regional checkpoint still completes, but the next checkpoint is forced to be global.
+   - **Tier 2**: If the forced global checkpoint also fails (has declined/timeout tasks), it aborts and the counter resets. A successful global checkpoint (whether forced or not) resets the counter to 0.
 4. **Savepoints**: Savepoint semantics are unchanged — they always require a full-graph snapshot regardless of this setting.
+5. **Bounded sources**: When all sources are finished, the next checkpoint is forced to be global to ensure side effects (e.g., Kafka transactions) are committed. If this forced global checkpoint fails, the job retries rather than terminating with a partial snapshot.
 
 ## Checkpoint Cleanup
 

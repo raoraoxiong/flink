@@ -24,6 +24,7 @@ import org.apache.flink.api.common.state.RegionalCheckpointInfo;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.execution.CheckpointType;
 import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.runtime.OperatorIDPair;
 import org.apache.flink.runtime.checkpoint.FinishedTaskStateProvider.PartialFinishingNotSupportedByStateException;
 import org.apache.flink.runtime.checkpoint.hooks.MasterHooks;
 import org.apache.flink.runtime.executiongraph.Execution;
@@ -87,6 +88,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -278,6 +280,20 @@ public class CheckpointCoordinator {
     private int consecutiveRegionalCheckpointCount = 0;
 
     /**
+     * Flag indicating that the next checkpoint MUST be a global checkpoint. Set when {@code
+     * consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures} (Tier 1). Cleared on
+     * successful global checkpoint or when the forced global checkpoint fails (Tier 2). Per
+     * FLIP-600 two-tier semantics.
+     */
+    private boolean forceGlobalNextCheckpoint = false;
+
+    /**
+     * Checker that returns true when all source vertices have finished. Used to detect bounded
+     * source job termination and force a global checkpoint, per FLIP-600 Section 9.
+     */
+    private Supplier<Boolean> allSourcesFinishedChecker = () -> false;
+
+    /**
      * Provider that maps an ExecutionVertexID to its pipeline region object. Two vertices returning
      * the same object (by reference equality) belong to the same pipeline region. Must be set
      * before regional checkpoint can work.
@@ -423,6 +439,14 @@ public class CheckpointCoordinator {
      */
     public void setRegionIdProvider(Function<ExecutionVertexID, Object> regionIdProvider) {
         this.regionIdProvider = regionIdProvider;
+    }
+
+    /**
+     * Sets the checker that detects whether all source vertices have finished. When true, the next
+     * checkpoint is forced to be global, per FLIP-600 Section 9 "Bounded Source".
+     */
+    public void setAllSourcesFinishedChecker(Supplier<Boolean> allSourcesFinishedChecker) {
+        this.allSourcesFinishedChecker = allSourcesFinishedChecker;
     }
 
     /**
@@ -686,6 +710,18 @@ public class CheckpointCoordinator {
                             .thenApplyAsync(
                                     plan -> {
                                         try {
+                                            // Per FLIP-600 Section 9 "Bounded Source": when all
+                                            // sources are finished, force the next checkpoint to
+                                            // be global so side effects are committed before
+                                            // job termination.
+                                            if (regionalCheckpointEnabled
+                                                    && !request.props.isSavepoint()
+                                                    && allSourcesFinishedChecker.get()) {
+                                                LOG.info(
+                                                        "All sources finished; forcing next "
+                                                                + "checkpoint to be global.");
+                                                forceGlobalNextCheckpoint = true;
+                                            }
                                             // this must happen outside the coordinator-wide lock,
                                             // because it communicates with external services
                                             // (in HA mode) and may block for a while.
@@ -1489,21 +1525,28 @@ public class CheckpointCoordinator {
             return;
         }
 
-        // 7. Check consecutive limit
-        if (consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures) {
+        // 7. Tier 2: if the next checkpoint was forced to be global but still has declined
+        //    tasks, abort and reset (per FLIP-600 two-tier max-consecutive-failures).
+        if (forceGlobalNextCheckpoint) {
             LOG.info(
-                    "Aborting regional checkpoint {} - consecutive count {} >= max {}",
-                    checkpointId,
-                    consecutiveRegionalCheckpointCount,
-                    regionalMaxConsecutiveFailures);
+                    "Aborting checkpoint {} - forced global checkpoint still has declined tasks "
+                            + "(Tier 2). Resetting consecutive count and force flag.",
+                    checkpointId);
+            forceGlobalNextCheckpoint = false;
+            consecutiveRegionalCheckpointCount = 0;
             abortPendingCheckpoint(
                     checkpoint,
                     new CheckpointException(
-                            "Consecutive regional checkpoint limit exceeded: "
-                                    + consecutiveRegionalCheckpointCount,
+                            "Forced global checkpoint failed (Tier 2): "
+                                    + declinedTasks.size()
+                                    + " tasks declined",
                             CheckpointFailureReason.CHECKPOINT_DECLINED));
             return;
         }
+        // Note: per FLIP-600 two-tier semantics, we do NOT abort the current regional
+        // checkpoint when consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures.
+        // Instead, the current regional checkpoint completes normally and sets
+        // forceGlobalNextCheckpoint = true so the NEXT checkpoint is forced global (Tier 1).
 
         // 8. Get last completed checkpoint for fallback state
         final CompletedCheckpoint lastCompleted = completedCheckpointStore.getLatestCheckpoint();
@@ -1792,6 +1835,20 @@ public class CheckpointCoordinator {
             consecutiveRegionalCheckpointCount++;
             statsTracker.reportRegionalCheckpointCompleted();
 
+            // Tier 1: if consecutive count reaches the limit, force the NEXT checkpoint
+            // to be global. Per FLIP-600 two-tier semantics, the current regional checkpoint
+            // still completes normally.
+            if (consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures
+                    && !forceGlobalNextCheckpoint) {
+                LOG.info(
+                        "Regional checkpoint {} completed. Consecutive count {} reached max {}. "
+                                + "Next checkpoint will be forced global (Tier 1).",
+                        checkpointId,
+                        consecutiveRegionalCheckpointCount,
+                        regionalMaxConsecutiveFailures);
+                forceGlobalNextCheckpoint = true;
+            }
+
             lastCheckpointCompletionRelativeTime = clock.relativeTimeMillis();
             logCheckpointInfo(completedCheckpoint);
 
@@ -1822,10 +1879,46 @@ public class CheckpointCoordinator {
                     completedCheckpoint.getTimestamp(),
                     extractIdIfDiscardedOnSubsumed(lastSubsumed));
 
-            // Notify coordinators with RegionalCheckpointInfo
+            // Notify failed-region tasks that the regional checkpoint completed but their
+            // state fell back to a historical checkpoint. Reuses the same task-side
+            // checkpoint-complete RPC path (confirmCheckpoint) with a non-invalid
+            // fallbackCheckpointId, so the notification survives task restarts, per
+            // FLIP-600 Per-Region Timeout Handling.
+            final long lastSubsumedId = extractIdIfDiscardedOnSubsumed(lastSubsumed);
+            for (ExecutionVertex ev :
+                    checkpoint.getCheckpointPlan().getTasksToCommitTo().stream()
+                            .filter(failedVertices::contains)
+                            .collect(Collectors.toList())) {
+                Execution ee = ev.getCurrentExecutionAttempt();
+                if (ee != null) {
+                    ee.notifyCheckpointOnComplete(
+                            checkpointId,
+                            completedCheckpoint.getTimestamp(),
+                            lastSubsumedId,
+                            fallbackCheckpointId);
+                }
+            }
+
+            // Notify coordinators: healthy-region coordinators receive
+            // notifyRegionalCheckpointComplete with RegionalCheckpointInfo; failed-region
+            // coordinators receive notifyRegionalCheckpointFallback so they can clean up
+            // coordinator-side state from the failed attempt (in addition to the state
+            // correction already performed via checkpointCoordinatorForRegionFallback).
+            final Set<OperatorID> failedRegionOps =
+                    failedVertices.stream()
+                            .flatMap(
+                                    ev ->
+                                            ev.getJobVertex().getOperatorIDs().stream()
+                                                    .map(OperatorIDPair::getGeneratedOperatorID))
+                            .collect(Collectors.toSet());
             for (OperatorCoordinatorCheckpointContext coordinatorContext :
                     coordinatorsToCheckpoint) {
-                coordinatorContext.notifyCheckpointComplete(checkpointId, regionalInfo);
+                if (failedRegionOps.contains(coordinatorContext.operatorId())) {
+                    coordinatorContext.notifyRegionalCheckpointFallback(
+                            checkpointId, fallbackCheckpointId);
+                } else {
+                    coordinatorContext.notifyRegionalCheckpointComplete(checkpointId, regionalInfo);
+                }
             }
 
             LOG.info(
@@ -1896,8 +1989,10 @@ public class CheckpointCoordinator {
             scheduleTriggerRequest();
         }
 
-        // A fully acknowledged checkpoint resets the consecutive regional counter
+        // A fully acknowledged checkpoint resets the consecutive regional counter and the
+        // force-global flag (per FLIP-600 two-tier max-consecutive-failures semantics).
         consecutiveRegionalCheckpointCount = 0;
+        forceGlobalNextCheckpoint = false;
 
         cleanupAfterCompletedCheckpoint(
                 pendingCheckpoint, checkpointId, completedCheckpoint, lastSubsumed, props);
@@ -2506,6 +2601,11 @@ public class CheckpointCoordinator {
         return consecutiveRegionalCheckpointCount;
     }
 
+    @VisibleForTesting
+    boolean getForceGlobalNextCheckpoint() {
+        return forceGlobalNextCheckpoint;
+    }
+
     public CheckpointStorageCoordinatorView getCheckpointStorage() {
         return checkpointStorageView;
     }
@@ -2882,17 +2982,32 @@ public class CheckpointCoordinator {
         @Override
         public void run() {
             synchronized (lock) {
-                // only do the work if the checkpoint is not discarded anyways
-                // note that checkpoint completion discards the pending checkpoint object
                 if (!pendingCheckpoint.isDisposed()) {
                     LOG.info(
                             "Checkpoint {} of job {} expired before completing.",
                             pendingCheckpoint.getCheckpointID(),
                             job);
-
-                    abortPendingCheckpoint(
-                            pendingCheckpoint,
-                            new CheckpointException(CheckpointFailureReason.CHECKPOINT_EXPIRED));
+                    // Per FLIP-600 Per-Region Timeout Handling: when regional checkpoint is
+                    // enabled and this is not a savepoint, treat unacknowledged tasks as
+                    // failed regions and attempt regional checkpoint completion instead of
+                    // directly aborting.
+                    if (regionalCheckpointEnabled && !pendingCheckpoint.getProps().isSavepoint()) {
+                        final int marked =
+                                pendingCheckpoint.markUnacknowledgedTasksAsDeclined(
+                                        new CheckpointException(
+                                                CheckpointFailureReason.CHECKPOINT_EXPIRED));
+                        LOG.info(
+                                "Regional checkpoint {} timed out. Marked {} unacknowledged "
+                                        + "task(s) as failed for regional evaluation.",
+                                pendingCheckpoint.getCheckpointID(),
+                                marked);
+                        tryCompleteRegionalCheckpoint(pendingCheckpoint);
+                    } else {
+                        abortPendingCheckpoint(
+                                pendingCheckpoint,
+                                new CheckpointException(
+                                        CheckpointFailureReason.CHECKPOINT_EXPIRED));
+                    }
                 }
             }
         }

@@ -287,6 +287,29 @@ public class PendingCheckpoint implements Checkpoint {
     }
 
     /**
+     * Marks all tasks that have neither acknowledged nor declined as declined with the given cause.
+     * This is used in regional checkpoint mode when a checkpoint timeout fires: unacknowledged
+     * tasks are treated as failed (their regions become failed regions) so that {@link
+     * CheckpointCoordinator#tryCompleteRegionalCheckpoint} can evaluate whether a regional
+     * checkpoint is still possible per FLIP-600 Per-Region Timeout Handling.
+     *
+     * @param cause the exception to associate with each newly-declined task
+     * @return the number of tasks that were marked as declined by this call
+     */
+    public int markUnacknowledgedTasksAsDeclined(CheckpointException cause) {
+        synchronized (lock) {
+            int marked = 0;
+            for (ExecutionAttemptID remaining : notYetAcknowledgedTasks.keySet()) {
+                if (!declinedTasks.containsKey(remaining)) {
+                    declinedTasks.put(remaining, cause);
+                    marked++;
+                }
+            }
+            return marked;
+        }
+    }
+
+    /**
      * Returns true if every task in this checkpoint has either acknowledged or declined. This is
      * used in regional checkpoint mode to determine when to evaluate the checkpoint.
      */

@@ -564,7 +564,8 @@ public class CheckpointCoordinatorTestingUtils {
                 JobID jobId,
                 long completedCheckpointId,
                 long completedTimestamp,
-                long lastSubsumedCheckpointId) {
+                long lastSubsumedCheckpointId,
+                long fallbackCheckpointId) {
             notifiedCompletedCheckpoints
                     .computeIfAbsent(attemptId, k -> new ArrayList<>())
                     .add(new NotifiedCheckpoint(jobId, completedCheckpointId, completedTimestamp));
@@ -1015,6 +1016,7 @@ public class CheckpointCoordinatorTestingUtils {
         private final List<Long> completedCheckpoints;
         private final List<Long> abortedCheckpoints;
         private final List<Long> regionalCompletedCheckpoints;
+        private final List<Long> regionalFallbackCheckpoints;
 
         private MockOperatorCoordinatorCheckpointContext(
                 BiConsumer<Long, CompletableFuture<byte[]>> onCallingCheckpointCoordinator,
@@ -1031,6 +1033,7 @@ public class CheckpointCoordinatorTestingUtils {
             this.completedCheckpoints = new ArrayList<>();
             this.abortedCheckpoints = new ArrayList<>();
             this.regionalCompletedCheckpoints = new ArrayList<>();
+            this.regionalFallbackCheckpoints = new ArrayList<>();
         }
 
         @Override
@@ -1054,10 +1057,15 @@ public class CheckpointCoordinatorTestingUtils {
         }
 
         @Override
-        public void notifyCheckpointComplete(
+        public void notifyRegionalCheckpointComplete(
                 long checkpointId, org.apache.flink.api.common.state.RegionalCheckpointInfo info) {
             regionalCompletedCheckpoints.add(checkpointId);
             completedCheckpoints.add(checkpointId);
+        }
+
+        @Override
+        public void notifyRegionalCheckpointFallback(long checkpointId, long fallbackCheckpointId) {
+            regionalFallbackCheckpoints.add(checkpointId);
         }
 
         @Override
@@ -1117,6 +1125,10 @@ public class CheckpointCoordinatorTestingUtils {
 
         public List<Long> getRegionalCompletedCheckpoints() {
             return regionalCompletedCheckpoints;
+        }
+
+        public List<Long> getRegionalFallbackCheckpoints() {
+            return regionalFallbackCheckpoints;
         }
     }
 }

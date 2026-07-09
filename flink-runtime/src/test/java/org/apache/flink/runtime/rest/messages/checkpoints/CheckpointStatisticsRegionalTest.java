@@ -168,4 +168,75 @@ class CheckpointStatisticsRegionalTest {
 
         assertThat(deserialized.getOldestRefCheckpointId()).isEqualTo(15L);
     }
+
+    @Test
+    void testCheckpointLevelOldestRefCheckpointIdRoundTrip() throws Exception {
+        // Use generateCheckpointStatistics to produce a valid CompletedCheckpointStatistics
+        // with oldest_ref_checkpoint_id set, then verify it survives JSON round-trip.
+        // This reuses the same aggregation path tested in
+        // RegionalCheckpointStatisticsAggregationTest.
+        // Here we focus on serialization integrity of the top-level field.
+        final org.apache.flink.runtime.checkpoint.CheckpointStatsStatus status =
+                org.apache.flink.runtime.checkpoint.CheckpointStatsStatus.COMPLETED;
+        final org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatistics stats =
+                new org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatistics
+                        .CompletedCheckpointStatistics(
+                        1L,
+                        status,
+                        false,
+                        null,
+                        1000L,
+                        500L,
+                        1024L,
+                        2048L,
+                        0L,
+                        0L,
+                        0L,
+                        0L,
+                        4,
+                        4,
+                        org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatistics
+                                .RestAPICheckpointType.CHECKPOINT,
+                        java.util.Collections.emptyMap(),
+                        null,
+                        false,
+                        42L);
+
+        final String json = MAPPER.writeValueAsString(stats);
+        final JsonNode jsonNode = MAPPER.readTree(json);
+        assertThat(jsonNode.has("oldest_ref_checkpoint_id")).isTrue();
+        assertThat(jsonNode.get("oldest_ref_checkpoint_id").asLong()).isEqualTo(42L);
+    }
+
+    @Test
+    void testCheckpointLevelOldestRefCheckpointIdOmittedWhenNull() throws Exception {
+        final org.apache.flink.runtime.checkpoint.CheckpointStatsStatus status =
+                org.apache.flink.runtime.checkpoint.CheckpointStatsStatus.COMPLETED;
+        final org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatistics stats =
+                new org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatistics
+                        .CompletedCheckpointStatistics(
+                        1L,
+                        status,
+                        false,
+                        null,
+                        1000L,
+                        500L,
+                        1024L,
+                        2048L,
+                        0L,
+                        0L,
+                        0L,
+                        0L,
+                        4,
+                        4,
+                        org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatistics
+                                .RestAPICheckpointType.CHECKPOINT,
+                        java.util.Collections.emptyMap(),
+                        null,
+                        false,
+                        null);
+
+        final JsonNode jsonNode = MAPPER.valueToTree(stats);
+        assertThat(jsonNode.has("oldest_ref_checkpoint_id")).isFalse();
+    }
 }

@@ -216,8 +216,11 @@ class RegionalCheckpointSuccessPathTest {
         assertThat(coordinatorState).isNotNull();
         assertThat(coordinatorState.getData()).isEqualTo(fallbackBytes);
 
-        // The coordinator was notified via the regional notify path.
-        assertThat(coordCtx.getRegionalCompletedCheckpoints()).contains(checkpointId);
+        // The coordinator was notified via the regional fallback path (it's in the failed region).
+        assertThat(coordCtx.getRegionalFallbackCheckpoints()).contains(checkpointId);
+        // Healthy-region coordinators would receive notifyRegionalCheckpointComplete; the failed
+        // region's coordinator receives notifyRegionalCheckpointFallback instead.
+        assertThat(coordCtx.getRegionalCompletedCheckpoints()).doesNotContain(checkpointId);
 
         coordinator.shutdown();
     }

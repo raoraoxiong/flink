@@ -893,6 +893,14 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
             final var topology = executionTopology;
             checkpointCoordinator.setRegionIdProvider(
                     vertexId -> topology.getPipelinedRegionOfVertex(vertexId));
+
+            // Wire all-sources-finished checker for Bounded Source forced global checkpoint,
+            // per FLIP-600 Section 9. A source vertex is one with no inputs.
+            checkpointCoordinator.setAllSourcesFinishedChecker(
+                    () ->
+                            getAllVertices().values().stream()
+                                    .filter(v -> v.getInputs() == null || v.getInputs().isEmpty())
+                                    .allMatch(ExecutionJobVertex::isFinished));
         }
     }
 
