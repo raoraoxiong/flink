@@ -20,11 +20,9 @@ package org.apache.flink.runtime.checkpoint;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.state.RegionalCheckpointInfo;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.execution.CheckpointType;
 import org.apache.flink.core.execution.SavepointFormatType;
-import org.apache.flink.runtime.OperatorIDPair;
 import org.apache.flink.runtime.checkpoint.FinishedTaskStateProvider.PartialFinishingNotSupportedByStateException;
 import org.apache.flink.runtime.checkpoint.hooks.MasterHooks;
 import org.apache.flink.runtime.executiongraph.Execution;
@@ -71,7 +69,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -276,29 +273,8 @@ public class CheckpointCoordinator {
     /** Maximum consecutive checkpoints that may reference historical state. */
     private final int regionalMaxConsecutiveFailures;
 
-    /** Counter tracking consecutive regional checkpoints. */
-    private int consecutiveRegionalCheckpointCount = 0;
-
-    /**
-     * Flag indicating that the next checkpoint MUST be a global checkpoint. Set when {@code
-     * consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures} (Tier 1). Cleared on
-     * successful global checkpoint or when the forced global checkpoint fails (Tier 2). Per
-     * FLIP-600 two-tier semantics.
-     */
-    private boolean forceGlobalNextCheckpoint = false;
-
-    /**
-     * Checker that returns true when all source vertices have finished. Used to detect bounded
-     * source job termination and force a global checkpoint, per FLIP-600 Section 9.
-     */
-    private Supplier<Boolean> allSourcesFinishedChecker = () -> false;
-
-    /**
-     * Provider that maps an ExecutionVertexID to its pipeline region object. Two vertices returning
-     * the same object (by reference equality) belong to the same pipeline region. Must be set
-     * before regional checkpoint can work.
-     */
-    @Nullable private Function<ExecutionVertexID, Object> regionIdProvider;
+    /** Handles regional checkpoint logic (FLIP-600). */
+    private final RegionalCheckpointHandler regionalCheckpointHandler;
 
     // --------------------------------------------------------------------------------------------
 
@@ -422,6 +398,16 @@ public class CheckpointCoordinator {
         this.regionalCheckpointEnabled = chkConfig.isRegionalCheckpointEnabled();
         this.regionalMaxFailureRatio = chkConfig.getRegionalMaxFailureRatio();
         this.regionalMaxConsecutiveFailures = chkConfig.getRegionalMaxConsecutiveFailures();
+        this.regionalCheckpointHandler =
+                new RegionalCheckpointHandler(
+                        this,
+                        lock,
+                        this.completedCheckpointStore,
+                        this.coordinatorsToCheckpoint,
+                        this.statsTracker,
+                        this.regionalCheckpointEnabled,
+                        this.regionalMaxFailureRatio,
+                        this.regionalMaxConsecutiveFailures);
     }
 
     // --------------------------------------------------------------------------------------------
@@ -430,23 +416,17 @@ public class CheckpointCoordinator {
 
     /** Returns whether regional checkpoint is enabled. */
     public boolean isRegionalCheckpointEnabled() {
-        return regionalCheckpointEnabled;
+        return regionalCheckpointHandler.isRegionalCheckpointEnabled();
     }
 
-    /**
-     * Sets the region ID provider used to determine which pipeline region each execution vertex
-     * belongs to. Must be called after the scheduling topology is initialized.
-     */
+    /** Sets the region ID provider for regional checkpoint support. */
     public void setRegionIdProvider(Function<ExecutionVertexID, Object> regionIdProvider) {
-        this.regionIdProvider = regionIdProvider;
+        regionalCheckpointHandler.setRegionIdProvider(regionIdProvider);
     }
 
-    /**
-     * Sets the checker that detects whether all source vertices have finished. When true, the next
-     * checkpoint is forced to be global, per FLIP-600 Section 9 "Bounded Source".
-     */
+    /** Sets the all-sources-finished checker (FLIP-600 Section 9). */
     public void setAllSourcesFinishedChecker(Supplier<Boolean> allSourcesFinishedChecker) {
-        this.allSourcesFinishedChecker = allSourcesFinishedChecker;
+        regionalCheckpointHandler.setAllSourcesFinishedChecker(allSourcesFinishedChecker);
     }
 
     /**
@@ -710,21 +690,9 @@ public class CheckpointCoordinator {
                             .thenApplyAsync(
                                     plan -> {
                                         try {
-                                            // Per FLIP-600 Section 9 "Bounded Source": when all
-                                            // sources are finished, force the next checkpoint to
-                                            // be global so side effects are committed before
-                                            // job termination.
-                                            if (regionalCheckpointEnabled
-                                                    && !request.props.isSavepoint()
-                                                    && allSourcesFinishedChecker.get()) {
-                                                LOG.info(
-                                                        "All sources finished; forcing next "
-                                                                + "checkpoint to be global.");
-                                                forceGlobalNextCheckpoint = true;
-                                            }
-                                            // this must happen outside the coordinator-wide lock,
-                                            // because it communicates with external services
-                                            // (in HA mode) and may block for a while.
+                                            regionalCheckpointHandler
+                                                    .checkAllSourcesFinishedAndForceGlobal(
+                                                            request.props);
                                             long checkpointID =
                                                     checkpointIdCounter.getAndIncrement();
                                             return new Tuple2<>(plan, checkpointID);
@@ -1241,11 +1209,10 @@ public class CheckpointCoordinator {
                         checkpointException.getCause());
 
                 if (regionalCheckpointEnabled && !checkpoint.getProps().isSavepoint()) {
-                    // Buffer decline instead of aborting immediately
                     checkpoint.recordDecline(message.getTaskExecutionId(), checkpointException);
 
                     if (checkpoint.areAllTasksResponded()) {
-                        tryCompleteRegionalCheckpoint(checkpoint);
+                        regionalCheckpointHandler.tryCompleteRegionalCheckpoint(checkpoint);
                     }
                 } else {
                     abortPendingCheckpoint(
@@ -1348,7 +1315,7 @@ public class CheckpointCoordinator {
                         } else if (regionalCheckpointEnabled
                                 && checkpoint.hasDeclines()
                                 && checkpoint.areAllTasksResponded()) {
-                            tryCompleteRegionalCheckpoint(checkpoint);
+                            regionalCheckpointHandler.tryCompleteRegionalCheckpoint(checkpoint);
                         }
                         break;
                     case DUPLICATE:
@@ -1439,514 +1406,6 @@ public class CheckpointCoordinator {
     }
 
     /**
-     * Evaluates a regional checkpoint after all tasks have responded with a mix of acknowledgements
-     * and declines. Determines which pipeline regions have failed tasks, checks limits, assembles
-     * state from the last completed checkpoint for failed regions, and completes the checkpoint
-     * with only healthy regions being notified.
-     *
-     * <p>Important: This method should only be called in the checkpoint lock scope.
-     */
-    private void tryCompleteRegionalCheckpoint(PendingCheckpoint checkpoint) {
-        assert (Thread.holdsLock(lock));
-        final long checkpointId = checkpoint.getCheckpointID();
-        LOG.info("Regional Checkpoint evaluation triggered for checkpoint {}", checkpointId);
-
-        // 1. Build mapping from ExecutionAttemptID to ExecutionVertex for declined tasks
-        final Map<ExecutionAttemptID, CheckpointException> declinedTasks =
-                checkpoint.getDeclinedTasks();
-        final List<Execution> tasksToWaitFor = checkpoint.getCheckpointPlan().getTasksToWaitFor();
-        final Map<ExecutionAttemptID, ExecutionVertex> attemptToVertex = new HashMap<>();
-        for (Execution execution : tasksToWaitFor) {
-            attemptToVertex.put(execution.getAttemptId(), execution.getVertex());
-        }
-
-        // 2. Check regionIdProvider availability
-        if (regionIdProvider == null) {
-            LOG.warn("Aborting regional checkpoint {} - regionIdProvider not set", checkpointId);
-            abortPendingCheckpoint(
-                    checkpoint,
-                    new CheckpointException(
-                            "RegionIdProvider not set - cannot compute pipeline regions",
-                            CheckpointFailureReason.CHECKPOINT_DECLINED));
-            return;
-        }
-
-        // 3. Compute region membership for all vertices using subtask-level region objects
-        //    Use IdentityHashMap since region identity is determined by object reference
-        final Map<Object, Set<ExecutionVertex>> regionToVertices = new IdentityHashMap<>();
-        for (Execution execution : tasksToWaitFor) {
-            ExecutionVertex ev = execution.getVertex();
-            Object region = regionIdProvider.apply(ev.getID());
-            regionToVertices.computeIfAbsent(region, k -> new HashSet<>()).add(ev);
-        }
-        final int totalRegions = regionToVertices.size();
-
-        // 4. If single region → abort (ALL_TO_ALL topology, regional checkpoint not applicable)
-        if (totalRegions <= 1) {
-            LOG.info(
-                    "Aborting regional checkpoint {} - job has only {} pipeline region(s)",
-                    checkpointId,
-                    totalRegions);
-            abortPendingCheckpoint(
-                    checkpoint,
-                    new CheckpointException(
-                            "Single pipeline region - regional checkpoint not applicable",
-                            CheckpointFailureReason.CHECKPOINT_DECLINED));
-            return;
-        }
-
-        // 5. Determine failed regions (regions containing at least one declined task)
-        final Set<Object> failedRegions = Collections.newSetFromMap(new IdentityHashMap<>());
-        for (ExecutionAttemptID declinedAttemptId : declinedTasks.keySet()) {
-            ExecutionVertex vertex = attemptToVertex.get(declinedAttemptId);
-            if (vertex != null) {
-                failedRegions.add(regionIdProvider.apply(vertex.getID()));
-            }
-        }
-
-        // 6. Check failure ratio
-        final double failureRatio = (double) failedRegions.size() / totalRegions;
-        if (failureRatio > regionalMaxFailureRatio) {
-            LOG.info(
-                    "Aborting regional checkpoint {} - failure ratio {}/{} = {} exceeds max {}",
-                    checkpointId,
-                    failedRegions.size(),
-                    totalRegions,
-                    failureRatio,
-                    regionalMaxFailureRatio);
-            abortPendingCheckpoint(
-                    checkpoint,
-                    new CheckpointException(
-                            "Regional checkpoint failure ratio exceeded: "
-                                    + failedRegions.size()
-                                    + "/"
-                                    + totalRegions,
-                            CheckpointFailureReason.CHECKPOINT_DECLINED));
-            return;
-        }
-
-        // 7. Tier 2: if the next checkpoint was forced to be global but still has declined
-        //    tasks, abort and reset (per FLIP-600 two-tier max-consecutive-failures).
-        if (forceGlobalNextCheckpoint) {
-            LOG.info(
-                    "Aborting checkpoint {} - forced global checkpoint still has declined tasks "
-                            + "(Tier 2). Resetting consecutive count and force flag.",
-                    checkpointId);
-            forceGlobalNextCheckpoint = false;
-            consecutiveRegionalCheckpointCount = 0;
-            abortPendingCheckpoint(
-                    checkpoint,
-                    new CheckpointException(
-                            "Forced global checkpoint failed (Tier 2): "
-                                    + declinedTasks.size()
-                                    + " tasks declined",
-                            CheckpointFailureReason.CHECKPOINT_DECLINED));
-            return;
-        }
-        // Note: per FLIP-600 two-tier semantics, we do NOT abort the current regional
-        // checkpoint when consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures.
-        // Instead, the current regional checkpoint completes normally and sets
-        // forceGlobalNextCheckpoint = true so the NEXT checkpoint is forced global (Tier 1).
-
-        // 8. Get last completed checkpoint for fallback state
-        final CompletedCheckpoint lastCompleted = completedCheckpointStore.getLatestCheckpoint();
-        if (lastCompleted == null) {
-            LOG.info(
-                    "Aborting regional checkpoint {} - no historical checkpoint available",
-                    checkpointId);
-            abortPendingCheckpoint(
-                    checkpoint,
-                    new CheckpointException(
-                            "No historical checkpoint for regional fallback",
-                            CheckpointFailureReason.CHECKPOINT_DECLINED));
-            return;
-        }
-        final long fallbackCheckpointId = lastCompleted.getCheckpointID();
-
-        // 9. Collect all vertices in failed regions
-        final Set<ExecutionVertex> failedVertices = new HashSet<>();
-        for (Object failedRegion : failedRegions) {
-            Set<ExecutionVertex> regionVertices = regionToVertices.get(failedRegion);
-            if (regionVertices != null) {
-                failedVertices.addAll(regionVertices);
-            }
-        }
-
-        // 10. Collect operator IDs in failed regions and check coordinator support
-        final Set<OperatorID> failedRegionOperatorIds = new HashSet<>();
-        for (ExecutionVertex ev : failedVertices) {
-            ev.getJobVertex()
-                    .getOperatorIDs()
-                    .forEach(pair -> failedRegionOperatorIds.add(pair.getGeneratedOperatorID()));
-        }
-
-        for (OperatorCoordinatorCheckpointContext coordCtx : coordinatorsToCheckpoint) {
-            if (failedRegionOperatorIds.contains(coordCtx.operatorId())) {
-                if (!coordCtx.supportsRegionCheckpoint()) {
-                    LOG.info(
-                            "Aborting regional checkpoint {} - coordinator {} does not support "
-                                    + "regional checkpoint",
-                            checkpointId,
-                            coordCtx.operatorId());
-                    abortPendingCheckpoint(
-                            checkpoint,
-                            new CheckpointException(
-                                    "Coordinator "
-                                            + coordCtx.operatorId()
-                                            + " does not support regional checkpoint",
-                                    CheckpointFailureReason.CHECKPOINT_DECLINED));
-                    return;
-                }
-            }
-        }
-
-        // 9. Assemble state: for failed region subtasks use state from lastCompleted
-        final Map<OperatorID, OperatorState> currentStates = checkpoint.getOperatorStates();
-        final Map<OperatorID, OperatorState> lastCompletedStates =
-                lastCompleted.getOperatorStates();
-
-        // Build set of failed subtask indices per operator
-        final Map<OperatorID, Set<Integer>> failedSubtasksByOperator = new HashMap<>();
-        for (ExecutionVertex failedVertex : failedVertices) {
-            final int subtaskIndex = failedVertex.getParallelSubtaskIndex();
-            failedVertex
-                    .getJobVertex()
-                    .getOperatorIDs()
-                    .forEach(
-                            pair ->
-                                    failedSubtasksByOperator
-                                            .computeIfAbsent(
-                                                    pair.getGeneratedOperatorID(),
-                                                    k -> new HashSet<>())
-                                            .add(subtaskIndex));
-        }
-
-        // Merge states: healthy subtask state from current checkpoint,
-        // failed subtask state from last completed checkpoint
-        for (Map.Entry<OperatorID, Set<Integer>> entry : failedSubtasksByOperator.entrySet()) {
-            final OperatorID opId = entry.getKey();
-            final Set<Integer> failedSubtasks = entry.getValue();
-            final OperatorState lastState = lastCompletedStates.get(opId);
-            final OperatorState currentState = currentStates.get(opId);
-
-            if (lastState != null && currentState != null) {
-                // Replace failed subtask states with those from the last completed checkpoint
-                for (int subtaskIdx : failedSubtasks) {
-                    OperatorSubtaskState fallbackState = lastState.getState(subtaskIdx);
-                    if (fallbackState != null) {
-                        currentState.putState(
-                                subtaskIdx,
-                                referenceFallbackState(
-                                        fallbackState, fallbackCheckpointId, checkpointId));
-                    }
-                }
-            } else if (lastState != null && currentState == null) {
-                // No current state for this operator (all subtasks in failed region)
-                // Create a new OperatorState with the fallback states
-                OperatorState newState =
-                        new OperatorState(
-                                null,
-                                null,
-                                opId,
-                                lastState.getParallelism(),
-                                lastState.getMaxParallelism());
-                for (int subtaskIdx : failedSubtasks) {
-                    OperatorSubtaskState fallbackState = lastState.getState(subtaskIdx);
-                    if (fallbackState != null) {
-                        newState.putState(
-                                subtaskIdx,
-                                referenceFallbackState(
-                                        fallbackState, fallbackCheckpointId, checkpointId));
-                    }
-                }
-                currentStates.put(opId, newState);
-            }
-        }
-
-        // 10. Call checkpointCoordinatorForRegionFallback on coordinators in failed regions
-        final Set<Integer> allFailedSubtaskIds = new HashSet<>();
-        for (ExecutionVertex failedVertex : failedVertices) {
-            allFailedSubtaskIds.add(failedVertex.getParallelSubtaskIndex());
-        }
-
-        final List<CompletableFuture<Void>> coordinatorFutures = new ArrayList<>();
-        for (OperatorCoordinatorCheckpointContext coordCtx : coordinatorsToCheckpoint) {
-            if (failedRegionOperatorIds.contains(coordCtx.operatorId())) {
-                Set<Integer> subtasksForCoordinator =
-                        failedSubtasksByOperator.getOrDefault(
-                                coordCtx.operatorId(), Collections.emptySet());
-                if (!subtasksForCoordinator.isEmpty()) {
-                    CompletableFuture<byte[]> resultFuture = new CompletableFuture<>();
-                    try {
-                        coordCtx.checkpointCoordinatorForRegionFallback(
-                                checkpointId,
-                                fallbackCheckpointId,
-                                subtasksForCoordinator,
-                                resultFuture);
-                    } catch (Exception e) {
-                        LOG.warn(
-                                "Failed to invoke checkpointCoordinatorForRegionFallback on {}",
-                                coordCtx.operatorId(),
-                                e);
-                        abortPendingCheckpoint(
-                                checkpoint,
-                                new CheckpointException(
-                                        "Region fallback coordinator call failed",
-                                        CheckpointFailureReason.CHECKPOINT_DECLINED,
-                                        e));
-                        return;
-                    }
-
-                    final OperatorID opId = coordCtx.operatorId();
-                    final int coordParallelism = coordCtx.currentParallelism();
-                    final int coordMaxParallelism = coordCtx.maxParallelism();
-                    coordinatorFutures.add(
-                            resultFuture.thenAccept(
-                                    bytes -> {
-                                        synchronized (lock) {
-                                            final ByteStreamStateHandle coordinatorStateHandle =
-                                                    new ByteStreamStateHandle(
-                                                            "regionFallback-" + opId, bytes);
-                                            OperatorState state = currentStates.get(opId);
-                                            if (state == null) {
-                                                // All subtasks of this operator were in the failed
-                                                // region and had no historical state, so no
-                                                // OperatorState was created during state merge.
-                                                // Create one now so the coordinator fallback state
-                                                // is not silently dropped.
-                                                state =
-                                                        new OperatorState(
-                                                                null,
-                                                                null,
-                                                                opId,
-                                                                coordParallelism,
-                                                                coordMaxParallelism);
-                                                currentStates.put(opId, state);
-                                            }
-                                            // Overwrite rather than set: the coordinator may have
-                                            // already produced state during the failed regional
-                                            // attempt, which must be replaced by the historical
-                                            // fallback state.
-                                            state.overwriteCoordinatorState(coordinatorStateHandle);
-                                        }
-                                    }));
-                }
-            }
-        }
-
-        // 11. Complete the checkpoint
-        // For simplicity in this first implementation, complete synchronously if no async
-        // coordinator futures, otherwise schedule completion after futures resolve.
-        if (coordinatorFutures.isEmpty()) {
-            completeRegionalCheckpoint(checkpoint, failedVertices, fallbackCheckpointId);
-        } else {
-            // Wait for all coordinator futures to complete, then finalize
-            final PendingCheckpoint capturedCheckpoint = checkpoint;
-            FutureUtils.combineAll(coordinatorFutures)
-                    .thenAccept(
-                            ignored -> {
-                                synchronized (lock) {
-                                    if (!capturedCheckpoint.isDisposed()) {
-                                        completeRegionalCheckpoint(
-                                                capturedCheckpoint,
-                                                failedVertices,
-                                                fallbackCheckpointId);
-                                    }
-                                }
-                            })
-                    .exceptionally(
-                            t -> {
-                                synchronized (lock) {
-                                    if (!capturedCheckpoint.isDisposed()) {
-                                        abortPendingCheckpoint(
-                                                capturedCheckpoint,
-                                                new CheckpointException(
-                                                        "Region fallback future failed",
-                                                        CheckpointFailureReason.CHECKPOINT_DECLINED,
-                                                        t));
-                                    }
-                                }
-                                return null;
-                            });
-        }
-    }
-
-    /**
-     * Marks a fallback subtask state as referencing the historical checkpoint it originates from,
-     * and registers its shared state under the new checkpoint id.
-     *
-     * <p>The reference id allows the checkpoint cleaner to protect the referenced historical
-     * checkpoint from being subsumed. Re-registering the shared state under the new checkpoint id
-     * ensures the (incremental) shared state files are not deleted when the historical checkpoint
-     * is subsumed, since the failed subtask never sends an acknowledge message for the new
-     * checkpoint.
-     */
-    private OperatorSubtaskState referenceFallbackState(
-            OperatorSubtaskState fallbackState, long fallbackCheckpointId, long checkpointId) {
-        assert (Thread.holdsLock(lock));
-        final OperatorSubtaskState referencedState =
-                fallbackState.toBuilder().setRefCheckpointId(fallbackCheckpointId).build();
-        // Register shared state under the new checkpoint id so it is retained as long as the new
-        // (regional) checkpoint is retained, mirroring the normal acknowledge path.
-        referencedState.registerSharedStates(
-                completedCheckpointStore.getSharedStateRegistry(), checkpointId);
-        return referencedState;
-    }
-
-    /** Completes a regional checkpoint by finalizing it and notifying only healthy region tasks. */
-    private void completeRegionalCheckpoint(
-            PendingCheckpoint checkpoint,
-            Set<ExecutionVertex> failedVertices,
-            long fallbackCheckpointId) {
-        assert (Thread.holdsLock(lock));
-        try {
-            final long checkpointId = checkpoint.getCheckpointID();
-
-            // Report stats for subtasks in failed regions: they neither acknowledged nor declined
-            // into the stats, but their state was reused from the historical (fallback) checkpoint.
-            // This surfaces the reference id through metrics / REST before the stats are finalized.
-            final long fallbackStatsTimestamp = System.currentTimeMillis();
-            for (ExecutionVertex failedVertex : failedVertices) {
-                checkpoint.reportFallbackSubtaskStats(
-                        failedVertex.getJobvertexId(),
-                        failedVertex.getParallelSubtaskIndex(),
-                        fallbackStatsTimestamp,
-                        fallbackCheckpointId);
-            }
-
-            completedCheckpointStore.getSharedStateRegistry().checkpointCompleted(checkpointId);
-
-            final CompletedCheckpoint completedCheckpoint =
-                    checkpoint.finalizeRegionalCheckpoint(
-                            checkpointsCleaner, this::scheduleTriggerRequest, executor);
-            Preconditions.checkState(checkpoint.isDisposed() && completedCheckpoint != null);
-
-            final CompletedCheckpoint lastSubsumed =
-                    addCompletedCheckpointToStoreAndSubsumeOldest(
-                            checkpointId, completedCheckpoint, checkpoint);
-
-            reportCompletedCheckpoint(completedCheckpoint);
-            checkpoint.getCompletionFuture().complete(completedCheckpoint);
-
-            pendingCheckpoints.remove(checkpointId);
-            scheduleTriggerRequest();
-
-            // Increment consecutive regional checkpoint counter
-            consecutiveRegionalCheckpointCount++;
-            statsTracker.reportRegionalCheckpointCompleted();
-
-            // Tier 1: if consecutive count reaches the limit, force the NEXT checkpoint
-            // to be global. Per FLIP-600 two-tier semantics, the current regional checkpoint
-            // still completes normally.
-            if (consecutiveRegionalCheckpointCount >= regionalMaxConsecutiveFailures
-                    && !forceGlobalNextCheckpoint) {
-                LOG.info(
-                        "Regional checkpoint {} completed. Consecutive count {} reached max {}. "
-                                + "Next checkpoint will be forced global (Tier 1).",
-                        checkpointId,
-                        consecutiveRegionalCheckpointCount,
-                        regionalMaxConsecutiveFailures);
-                forceGlobalNextCheckpoint = true;
-            }
-
-            lastCheckpointCompletionRelativeTime = clock.relativeTimeMillis();
-            logCheckpointInfo(completedCheckpoint);
-
-            // Drop subsumed checkpoints
-            dropSubsumedCheckpoints(checkpointId);
-
-            // Notify only healthy region tasks
-            final List<ExecutionVertex> healthyTasks =
-                    checkpoint.getCheckpointPlan().getTasksToCommitTo().stream()
-                            .filter(ev -> !failedVertices.contains(ev))
-                            .collect(Collectors.toList());
-
-            // Build RegionalCheckpointInfo for coordinators
-            final Set<String> fallbackSubtaskIdentifiers = new HashSet<>();
-            for (ExecutionVertex ev : failedVertices) {
-                // getTaskNameWithSubtaskIndex() already includes the subtask index.
-                fallbackSubtaskIdentifiers.add(ev.getTaskNameWithSubtaskIndex());
-            }
-            final Map<Long, Set<String>> fallbackMap = new HashMap<>();
-            fallbackMap.put(fallbackCheckpointId, fallbackSubtaskIdentifiers);
-            final RegionalCheckpointInfo regionalInfo = new RegionalCheckpointInfo(fallbackMap);
-
-            // Send ack to healthy region tasks only. Coordinators are notified separately below
-            // with RegionalCheckpointInfo, so we must not notify them here as well.
-            sendAcknowledgeMessagesToTasks(
-                    healthyTasks,
-                    checkpointId,
-                    completedCheckpoint.getTimestamp(),
-                    extractIdIfDiscardedOnSubsumed(lastSubsumed));
-
-            // Notify failed-region tasks that the regional checkpoint completed but their
-            // state fell back to a historical checkpoint. Reuses the same task-side
-            // checkpoint-complete RPC path (confirmCheckpoint) with a non-invalid
-            // fallbackCheckpointId, so the notification survives task restarts, per
-            // FLIP-600 Per-Region Timeout Handling.
-            final long lastSubsumedId = extractIdIfDiscardedOnSubsumed(lastSubsumed);
-            for (ExecutionVertex ev :
-                    checkpoint.getCheckpointPlan().getTasksToCommitTo().stream()
-                            .filter(failedVertices::contains)
-                            .collect(Collectors.toList())) {
-                Execution ee = ev.getCurrentExecutionAttempt();
-                if (ee != null) {
-                    ee.notifyCheckpointOnComplete(
-                            checkpointId,
-                            completedCheckpoint.getTimestamp(),
-                            lastSubsumedId,
-                            fallbackCheckpointId);
-                }
-            }
-
-            // Notify coordinators: healthy-region coordinators receive
-            // notifyRegionalCheckpointComplete with RegionalCheckpointInfo; failed-region
-            // coordinators receive notifyRegionalCheckpointFallback so they can clean up
-            // coordinator-side state from the failed attempt (in addition to the state
-            // correction already performed via checkpointCoordinatorForRegionFallback).
-            final Set<OperatorID> failedRegionOps =
-                    failedVertices.stream()
-                            .flatMap(
-                                    ev ->
-                                            ev.getJobVertex().getOperatorIDs().stream()
-                                                    .map(OperatorIDPair::getGeneratedOperatorID))
-                            .collect(Collectors.toSet());
-            for (OperatorCoordinatorCheckpointContext coordinatorContext :
-                    coordinatorsToCheckpoint) {
-                if (failedRegionOps.contains(coordinatorContext.operatorId())) {
-                    coordinatorContext.notifyRegionalCheckpointFallback(
-                            checkpointId, fallbackCheckpointId);
-                } else {
-                    coordinatorContext.notifyRegionalCheckpointComplete(checkpointId, regionalInfo);
-                }
-            }
-
-            LOG.info(
-                    "Regional checkpoint {} completed successfully. "
-                            + "Notified {} healthy tasks, {} tasks in failed regions.",
-                    checkpointId,
-                    healthyTasks.size(),
-                    failedVertices.size());
-
-        } catch (Exception e) {
-            checkpoint.getCompletionFuture().completeExceptionally(e);
-            if (!checkpoint.isDisposed()) {
-                abortPendingCheckpoint(
-                        checkpoint,
-                        new CheckpointException(
-                                CheckpointFailureReason.FINALIZE_CHECKPOINT_FAILURE, e));
-            }
-        }
-    }
-
-    /**
-     * Computes pipelined regions from a set of ExecutionJobVertices using union-find. Two job
-     * vertices are in the same region if connected by an intermediate result whose partition type
-     * must be pipelined consumed.
-     *
-     * @return a map from each ExecutionJobVertex to its region (a Set of ExecutionJobVertex)
-     */
-    /**
      * Try to complete the given pending checkpoint.
      *
      * <p>Important: This method should only be called in the checkpoint lock scope.
@@ -1991,14 +1450,13 @@ public class CheckpointCoordinator {
 
         // A fully acknowledged checkpoint resets the consecutive regional counter and the
         // force-global flag (per FLIP-600 two-tier max-consecutive-failures semantics).
-        consecutiveRegionalCheckpointCount = 0;
-        forceGlobalNextCheckpoint = false;
+        regionalCheckpointHandler.resetOnGlobalSuccess();
 
         cleanupAfterCompletedCheckpoint(
                 pendingCheckpoint, checkpointId, completedCheckpoint, lastSubsumed, props);
     }
 
-    private void reportCompletedCheckpoint(CompletedCheckpoint completedCheckpoint) {
+    void reportCompletedCheckpoint(CompletedCheckpoint completedCheckpoint) {
         failureManager.handleCheckpointSuccess(completedCheckpoint.getCheckpointID());
         CompletedCheckpointStats completedCheckpointStats = completedCheckpoint.getStatistic();
         if (completedCheckpointStats != null) {
@@ -2041,7 +1499,7 @@ public class CheckpointCoordinator {
         }
     }
 
-    private void logCheckpointInfo(CompletedCheckpoint completedCheckpoint) {
+    void logCheckpointInfo(CompletedCheckpoint completedCheckpoint) {
         LOG.info(
                 "Completed checkpoint {} for job {} ({} bytes, checkpointDuration={} ms, finalizationTime={} ms).",
                 completedCheckpoint.getCheckpointID(),
@@ -2094,7 +1552,7 @@ public class CheckpointCoordinator {
         }
     }
 
-    private long extractIdIfDiscardedOnSubsumed(CompletedCheckpoint lastSubsumed) {
+    long extractIdIfDiscardedOnSubsumed(CompletedCheckpoint lastSubsumed) {
         final long lastSubsumedCheckpointId;
         if (lastSubsumed != null && lastSubsumed.getProperties().discardOnSubsumed()) {
             lastSubsumedCheckpointId = lastSubsumed.getCheckpointID();
@@ -2104,7 +1562,7 @@ public class CheckpointCoordinator {
         return lastSubsumedCheckpointId;
     }
 
-    private CompletedCheckpoint addCompletedCheckpointToStoreAndSubsumeOldest(
+    CompletedCheckpoint addCompletedCheckpointToStoreAndSubsumeOldest(
             long checkpointId,
             CompletedCheckpoint completedCheckpoint,
             PendingCheckpoint pendingCheckpoint)
@@ -2176,31 +1634,17 @@ public class CheckpointCoordinator {
             long completedTimestamp,
             long lastSubsumedCheckpointId) {
         // commit tasks
-        sendAcknowledgeMessagesToTasks(
-                tasksToCommit, completedCheckpointId, completedTimestamp, lastSubsumedCheckpointId);
-
-        // commit coordinators
-        for (OperatorCoordinatorCheckpointContext coordinatorContext : coordinatorsToCheckpoint) {
-            coordinatorContext.notifyCheckpointComplete(completedCheckpointId);
-        }
-    }
-
-    /**
-     * Sends checkpoint-complete notifications to the given tasks only, without notifying operator
-     * coordinators. Used by the regional checkpoint path, which notifies coordinators separately
-     * with {@link RegionalCheckpointInfo}.
-     */
-    private void sendAcknowledgeMessagesToTasks(
-            List<ExecutionVertex> tasksToCommit,
-            long completedCheckpointId,
-            long completedTimestamp,
-            long lastSubsumedCheckpointId) {
         for (ExecutionVertex ev : tasksToCommit) {
             Execution ee = ev.getCurrentExecutionAttempt();
             if (ee != null) {
                 ee.notifyCheckpointOnComplete(
                         completedCheckpointId, completedTimestamp, lastSubsumedCheckpointId);
             }
+        }
+
+        // commit coordinators
+        for (OperatorCoordinatorCheckpointContext coordinatorContext : coordinatorsToCheckpoint) {
+            coordinatorContext.notifyCheckpointComplete(completedCheckpointId);
         }
     }
 
@@ -2244,7 +1688,7 @@ public class CheckpointCoordinator {
         recentExpiredCheckpoints.addLast(id);
     }
 
-    private void dropSubsumedCheckpoints(long checkpointId) {
+    void dropSubsumedCheckpoints(long checkpointId) {
         abortPendingCheckpoints(
                 checkpoint ->
                         checkpoint.getCheckpointID() < checkpointId && checkpoint.canBeSubsumed(),
@@ -2598,12 +2042,12 @@ public class CheckpointCoordinator {
 
     @VisibleForTesting
     int getConsecutiveRegionalCheckpointCount() {
-        return consecutiveRegionalCheckpointCount;
+        return regionalCheckpointHandler.getConsecutiveRegionalCheckpointCount();
     }
 
     @VisibleForTesting
     boolean getForceGlobalNextCheckpoint() {
-        return forceGlobalNextCheckpoint;
+        return regionalCheckpointHandler.getForceGlobalNextCheckpoint();
     }
 
     public CheckpointStorageCoordinatorView getCheckpointStorage() {
@@ -2612,6 +2056,28 @@ public class CheckpointCoordinator {
 
     public CompletedCheckpointStore getCheckpointStore() {
         return completedCheckpointStore;
+    }
+
+    // Package-private accessors for RegionalCheckpointHandler
+
+    CheckpointsCleaner getCheckpointsCleaner() {
+        return checkpointsCleaner;
+    }
+
+    Executor getExecutor() {
+        return executor;
+    }
+
+    Clock getClock() {
+        return clock;
+    }
+
+    void removePendingCheckpoint(long checkpointId) {
+        pendingCheckpoints.remove(checkpointId);
+    }
+
+    void setLastCheckpointCompletionRelativeTime(long time) {
+        lastCheckpointCompletionRelativeTime = time;
     }
 
     /**
@@ -2901,13 +2367,13 @@ public class CheckpointCoordinator {
         }
     }
 
-    private void abortPendingCheckpoint(
+    void abortPendingCheckpoint(
             PendingCheckpoint pendingCheckpoint, CheckpointException exception) {
 
         abortPendingCheckpoint(pendingCheckpoint, exception, null);
     }
 
-    private void abortPendingCheckpoint(
+    void abortPendingCheckpoint(
             PendingCheckpoint pendingCheckpoint,
             CheckpointException exception,
             @Nullable final ExecutionAttemptID executionAttemptID) {
@@ -3001,7 +2467,7 @@ public class CheckpointCoordinator {
                                         + "task(s) as failed for regional evaluation.",
                                 pendingCheckpoint.getCheckpointID(),
                                 marked);
-                        tryCompleteRegionalCheckpoint(pendingCheckpoint);
+                        regionalCheckpointHandler.tryCompleteRegionalCheckpoint(pendingCheckpoint);
                     } else {
                         abortPendingCheckpoint(
                                 pendingCheckpoint,
