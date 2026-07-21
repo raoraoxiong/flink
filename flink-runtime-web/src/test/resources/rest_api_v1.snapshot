@@ -1801,6 +1801,9 @@
                       },
                       "num_acknowledged_subtasks" : {
                         "type" : "integer"
+                      },
+                      "oldest_ref_checkpoint_id" : {
+                        "type" : "integer"
                       }
                     }
                   }
@@ -1810,6 +1813,9 @@
                 },
                 "discarded" : {
                   "type" : "boolean"
+                },
+                "oldest_ref_checkpoint_id" : {
+                  "type" : "integer"
                 }
               }
             },
@@ -1880,6 +1886,9 @@
                 },
                 "failure_message" : {
                   "type" : "string"
+                },
+                "oldest_ref_checkpoint_id" : {
+                  "type" : "integer"
                 }
               }
             },
@@ -1962,6 +1971,9 @@
                   "type" : "object",
                   "$ref" : "urn:jsonschema:org:apache:flink:runtime:rest:messages:checkpoints:TaskCheckpointStatistics"
                 }
+              },
+              "oldest_ref_checkpoint_id" : {
+                "type" : "integer"
               }
             }
           }
@@ -2077,6 +2089,15 @@
         },
         "changelog_storage" : {
           "type" : "string"
+        },
+        "regional_checkpoint_enabled" : {
+          "type" : "boolean"
+        },
+        "regional_max_failure_ratio" : {
+          "type" : "number"
+        },
+        "regional_max_consecutive_failures" : {
+          "type" : "integer"
         }
       }
     }
@@ -2189,9 +2210,15 @@
               },
               "num_acknowledged_subtasks" : {
                 "type" : "integer"
+              },
+              "oldest_ref_checkpoint_id" : {
+                "type" : "integer"
               }
             }
           }
+        },
+        "oldest_ref_checkpoint_id" : {
+          "type" : "integer"
         }
       }
     }
@@ -2352,6 +2379,9 @@
               }
             }
           }
+        },
+        "oldest_ref_checkpoint_id" : {
+          "type" : "integer"
         }
       }
     }
