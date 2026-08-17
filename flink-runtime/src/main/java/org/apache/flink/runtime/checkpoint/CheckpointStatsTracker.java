@@ -58,6 +58,13 @@ public interface CheckpointStatsTracker {
      */
     void reportCompletedCheckpoint(CompletedCheckpointStats completed);
 
+    /**
+     * Callback when a regional checkpoint completes (i.e. a checkpoint that reused historical state
+     * from failed regions). The actual metric reporting is implemented in the metrics PR; this
+     * no-op default ensures the core logic compiles independently.
+     */
+    default void reportRegionalCheckpointCompleted() {}
+
     @Nullable
     PendingCheckpointStats getPendingCheckpointStats(long checkpointId);
 
@@ -94,9 +101,6 @@ public interface CheckpointStatsTracker {
      * callback when triggering checkpoint failure before creating PendingCheckpoint.
      */
     void reportFailedCheckpointsWithoutInProgress();
-
-    /** Callback when a regional checkpoint completes successfully. */
-    void reportRegionalCheckpointCompleted();
 
     /**
      * Creates a new snapshot of the available stats.
